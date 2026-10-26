@@ -426,7 +426,7 @@ export default function App() {
                   <div className="piece-meta">
                     <strong>#{piece.label}</strong>
                     <span className="muted">
-                      {piece.shape.cells.length} cells · {piece.boardCells ? 'on board' : 'extra'}
+                      {piece.shape.cells.length} cells · {piece.boardCells ? 'on board' : 'loose'}
                       {canRotate(piece) ? '' : ' · fixed'}
                     </span>
                   </div>

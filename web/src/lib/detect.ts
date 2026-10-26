@@ -14,6 +14,13 @@ const MIN_SATURATION = 0.47
 const MIN_VALUE = 0.47
 const MIN_NODE_CORE_AREA = 20
 const NODE_CORE_RATIO = 0.6
+const LARGE_BLOB_PERCENTILE = 0.9
+const NODE_SIZE_TOLERANCE = 0.6
+const RIM_SAMPLE_COUNT = 48
+const RIM_RADIUS_RATIO = 0.8
+const MIN_RIM_COVERAGE = 0.75
+const DISK_RADIUS_RATIO = 0.95
+const MIN_DISK_COVERAGE = 0.64
 const NEIGHBOR_MIN_PITCHES = 0.65
 const NEIGHBOR_MAX_PITCHES = 1.35
 const BAR_SAMPLE_COUNT = 30
@@ -112,7 +119,7 @@ function findNodes(
     const label = blobs.labels[p]
     if (label && distance[p] > blobRadii[label]) blobRadii[label] = distance[p]
   }
-  const nodeRadius = median(
+  const nodeRadius = estimateNodeRadius(
     blobRadii.filter((_, label) => label > 0 && blobs.areas[label] >= MIN_NODE_CORE_AREA),
   )
   if (nodeRadius === 0) return { nodes: [], nodeRadius: 0 }
@@ -125,9 +132,43 @@ function findNodes(
   for (let label = 1; label <= coreComponents.count; label++) {
     if (coreComponents.areas[label] < MIN_NODE_CORE_AREA) continue
     const center = coreComponents.centroids[label]
+    if (rimCoverage(colored, width, height, center, nodeRadius) < MIN_RIM_COVERAGE) continue
+    if (diskCoverage(colored, width, height, center, nodeRadius) < MIN_DISK_COVERAGE) continue
     nodes.push({ ...center, ...nodeColor(image, hsv, colored, center, nodeRadius) })
   }
   return { nodes, nodeRadius }
+}
+
+function estimateNodeRadius(blobRadii: number[]): number {
+  if (blobRadii.length === 0) return 0
+  const sorted = [...blobRadii].sort((a, b) => a - b)
+  const reference = sorted[Math.floor((sorted.length - 1) * LARGE_BLOB_PERCENTILE)]
+  return median(sorted.filter((radius) => radius >= reference * NODE_SIZE_TOLERANCE))
+}
+
+function rimCoverage(colored: Uint8Array, width: number, height: number, center: Point, radius: number): number {
+  let covered = 0
+  for (let sample = 0; sample < RIM_SAMPLE_COUNT; sample++) {
+    const angle = (sample / RIM_SAMPLE_COUNT) * Math.PI * 2
+    const x = Math.round(center.x + Math.cos(angle) * radius * RIM_RADIUS_RATIO)
+    const y = Math.round(center.y + Math.sin(angle) * radius * RIM_RADIUS_RATIO)
+    if (x >= 0 && y >= 0 && x < width && y < height && colored[y * width + x]) covered++
+  }
+  return covered / RIM_SAMPLE_COUNT
+}
+
+function diskCoverage(colored: Uint8Array, width: number, height: number, center: Point, radius: number): number {
+  const reach = radius * DISK_RADIUS_RATIO
+  let inside = 0
+  let covered = 0
+  for (let y = Math.floor(center.y - reach); y <= Math.ceil(center.y + reach); y++) {
+    for (let x = Math.floor(center.x - reach); x <= Math.ceil(center.x + reach); x++) {
+      if ((x - center.x) ** 2 + (y - center.y) ** 2 > reach * reach) continue
+      inside++
+      if (x >= 0 && y >= 0 && x < width && y < height && colored[y * width + x]) covered++
+    }
+  }
+  return inside === 0 ? 0 : covered / inside
 }
 
 function nodeColor(
