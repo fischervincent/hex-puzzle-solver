@@ -13,7 +13,7 @@ const output = solve({
     id: piece.id,
     cells: piece.shape.cells,
     rotatable: piece.color !== fixedColor,
-    priority: true,
+    tier: 0,
   })),
   maxSolutions: 5,
   timeLimitMs: 5000,
@@ -21,7 +21,7 @@ const output = solve({
 console.log(`complete=${output.complete} explored=${output.explored} ${output.elapsedMs.toFixed(0)}ms`)
 for (const solution of output.solutions) {
   console.log(
-    `priority ${solution.priorityPlaced} optional ${solution.optionalPlaced} cells ${solution.cellsCovered}/${detection.board.length}: ` +
+    `placed by tier ${solution.placedByTier.join("/")} cells ${solution.cellsCovered}/${detection.board.length}: ` +
       solution.placements.map((p) => `#${p.pieceId + 1}r${p.rotation * 60}`).join(' '),
   )
 }

@@ -269,6 +269,10 @@ button.primary {
   transition: opacity 0.15s;
 }
 
+.piece-mandatory {
+  border-color: var(--accent);
+}
+
 .piece-optional {
   border-style: dashed;
 }
@@ -295,27 +299,8 @@ button.primary {
   font-size: 0.85rem;
 }
 
-.segmented {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  border: 1px solid var(--panel-border);
-  border-radius: 8px;
-  overflow: hidden;
-}
 
-.segmented button {
-  border: 0;
-  border-radius: 0;
-  padding: 5px 0;
-  font-size: 0.78rem;
-  background: transparent;
-  color: var(--muted);
-}
 
-.segmented button.active {
-  background: #33333d;
-  color: var(--text);
-}
 
 .solution-grid {
   display: grid;
@@ -395,4 +380,8 @@ button.primary {
   justify-content: space-between;
   align-items: center;
   font-size: 0.85rem;
+}
+
+.importance-select {
+  width: 100%;
 }

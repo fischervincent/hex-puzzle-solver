@@ -6,12 +6,16 @@ import { detect, type DetectedPiece, type Detection } from './lib/detect'
 import { FLAT_TOP_ANGLE, HEX_NEIGHBORS, addCells, cellKey, rectangularBoard, type Cell } from './lib/hex'
 import type { Solution, SolverInput, SolverOutput } from './lib/solver'
 
-type Importance = 'priority' | 'optional' | 'skip'
+type Importance = 'mandatory' | 'high' | 'medium' | 'optional' | 'skip'
 
-const IMPORTANCE_LEVELS: Importance[] = ['priority', 'optional', 'skip']
+const IMPORTANCE_LEVELS: Importance[] = ['mandatory', 'high', 'medium', 'optional', 'skip']
+const RANKED_LEVELS: Importance[] = ['mandatory', 'high', 'medium', 'optional']
+const DEFAULT_IMPORTANCE: Importance = 'medium'
 
 const IMPORTANCE_LABELS: Record<Importance, string> = {
-  priority: 'Priority',
+  mandatory: 'Mandatory',
+  high: 'High',
+  medium: 'Medium',
   optional: 'Optional',
   skip: 'Skip',
 }
@@ -50,6 +54,15 @@ function boardRing(board: Cell[]): Cell[] {
     }
   }
   return [...ring.values()]
+}
+
+function tierSummary(totalsByTier: number[], placedByTier?: number[]): string {
+  return RANKED_LEVELS.flatMap((level, tier) => {
+    const total = totalsByTier[tier]
+    if (total === 0) return []
+    const label = IMPORTANCE_LABELS[level].toLowerCase()
+    return [placedByTier ? `${placedByTier[tier]}/${total} ${label}` : `${total} ${label}`]
+  }).join(' · ')
 }
 
 function formatSeconds(milliseconds: number): string {
@@ -98,7 +111,7 @@ export default function App() {
     return byPiece
   }, [colorClasses])
 
-  const importanceOf = useCallback((piece: DetectedPiece) => importance[piece.id] ?? 'priority', [importance])
+  const importanceOf = useCallback((piece: DetectedPiece) => importance[piece.id] ?? DEFAULT_IMPORTANCE, [importance])
   const canRotate = useCallback(
     (piece: DetectedPiece) => {
       const colorClass = colorClassOf.get(piece.id)
@@ -181,7 +194,7 @@ export default function App() {
           id: piece.id,
           cells: piece.shape.cells,
           rotatable: canRotate(piece),
-          priority: importanceOf(piece) === 'priority',
+          tier: RANKED_LEVELS.indexOf(importanceOf(piece)),
         })),
       maxSolutions: SOLUTION_COUNT,
       timeLimitMs: timeLimit,
@@ -232,8 +245,7 @@ export default function App() {
 
   const piecesById = new Map(pieces.map((piece) => [piece.id, piece]))
   const resultIsStale = result !== null && result.inputKey !== solverInputKey
-  const priorityCount = solverInput.pieces.filter((piece) => piece.priority).length
-  const optionalCount = solverInput.pieces.length - priorityCount
+  const totalsByTier = RANKED_LEVELS.map((_, tier) => solverInput.pieces.filter((piece) => piece.tier === tier).length)
   const pieceCells = solverInput.pieces.reduce((sum, piece) => sum + piece.cells.length, 0)
 
   return (
@@ -430,18 +442,20 @@ export default function App() {
                       {canRotate(piece) ? '' : ' · fixed'}
                     </span>
                   </div>
-                  <div className="segmented">
+                  <select
+                    className="importance-select"
+                    value={importanceOf(piece)}
+                    onChange={(event) => {
+                      const level = IMPORTANCE_LEVELS.find((candidate) => candidate === event.target.value)
+                      if (level) setImportance((current) => ({ ...current, [piece.id]: level }))
+                    }}
+                  >
                     {IMPORTANCE_LEVELS.map((level) => (
-                      <button
-                        key={level}
-                        type="button"
-                        className={importanceOf(piece) === level ? 'active' : ''}
-                        onClick={() => setImportance((current) => ({ ...current, [piece.id]: level }))}
-                      >
+                      <option key={level} value={level}>
                         {IMPORTANCE_LABELS[level]}
-                      </button>
+                      </option>
                     ))}
-                  </div>
+                  </select>
                 </article>
               ))}
             </div>
@@ -478,9 +492,7 @@ export default function App() {
               Find placements
             </button>
           )}
-          <span className="muted">
-            {priorityCount} priority · {optionalCount} optional
-          </span>
+          <span className="muted">{tierSummary(totalsByTier)}</span>
         </div>
         {solving && <p className="status">Searching… (up to {timeLimit / 1000} s)</p>}
         {result && !solving && (
@@ -491,8 +503,7 @@ export default function App() {
             angle={angle}
             piecesById={piecesById}
             consideredIds={solverInput.pieces.map((piece) => piece.id)}
-            priorityTotal={priorityCount}
-            optionalTotal={optionalCount}
+            totalsByTier={totalsByTier}
           />
         )}
       </section>
@@ -507,14 +518,20 @@ type SolutionListProps = {
   angle: number
   piecesById: Map<number, Piece>
   consideredIds: number[]
-  priorityTotal: number
-  optionalTotal: number
+  totalsByTier: number[]
 }
 
 function SolutionList({ output, stale, consideredIds, ...cardProps }: SolutionListProps) {
   if (output.solutions.length === 0) return <p className="status">No placement found.</p>
+  const mandatoryTotal = cardProps.totalsByTier[0]
+  const mandatoryFits = output.solutions[0].placedByTier[0] === mandatoryTotal
   return (
     <>
+      {!mandatoryFits && (
+        <p className="status status-error">
+          {output.complete ? 'The mandatory pieces cannot all fit on this board.' : 'No layout found yet that fits every mandatory piece.'}
+        </p>
+      )}
       <p className="status">
         {output.complete
           ? `Search complete: these are the best placements (${formatSeconds(output.elapsedMs)}).`
@@ -537,12 +554,11 @@ type SolutionCardProps = {
   angle: number
   piecesById: Map<number, Piece>
   consideredIds: number[]
-  priorityTotal: number
-  optionalTotal: number
+  totalsByTier: number[]
 }
 
 function SolutionCard(props: SolutionCardProps) {
-  const { index, solution, board, angle, piecesById, consideredIds, priorityTotal, optionalTotal } = props
+  const { index, solution, board, angle, piecesById, consideredIds, totalsByTier } = props
   const drawn: DrawnPiece[] = solution.placements.flatMap((placement) => {
     const piece = piecesById.get(placement.pieceId)
     return piece
@@ -557,9 +573,7 @@ function SolutionCard(props: SolutionCardProps) {
       <header>
         <strong>Option {index + 1}</strong>
         <span className="muted">
-          {solution.priorityPlaced}/{priorityTotal} priority
-          {optionalTotal > 0 && ` · ${solution.optionalPlaced}/${optionalTotal} optional`} · {solution.cellsCovered}/
-          {board.length} cells
+          {tierSummary(totalsByTier, solution.placedByTier)} · {solution.cellsCovered}/{board.length} cells
         </span>
       </header>
       <BoardView board={board} angleDeg={angle} pieces={drawn} />

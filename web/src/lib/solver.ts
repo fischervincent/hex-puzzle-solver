@@ -4,7 +4,7 @@ export type SolverPiece = {
   id: number
   cells: Cell[]
   rotatable: boolean
-  priority: boolean
+  tier: number
 }
 
 export type SolverInput = {
@@ -18,8 +18,7 @@ export type Placement = { pieceId: number; rotation: number; cells: Cell[] }
 
 export type Solution = {
   placements: Placement[]
-  priorityPlaced: number
-  optionalPlaced: number
+  placedByTier: number[]
   cellsCovered: number
 }
 
@@ -35,14 +34,13 @@ type Orientation = { rotation: number; cells: Cell[] }
 type PieceType = {
   pieceIds: number[]
   size: number
-  priority: boolean
+  tier: number
   orientations: Orientation[]
 }
 
 type TypePlacement = { typeIndex: number; rotation: number; cellIndices: number[] }
 
-const PRIORITY_WEIGHT = 1_000_000
-const OPTIONAL_WEIGHT = 1_000
+const TIER_BASE = 1_000
 const CLOCK_CHECK_INTERVAL = 4096
 
 function orientationsOf(piece: SolverPiece): Orientation[] {
@@ -62,14 +60,12 @@ function groupIntoTypes(pieces: SolverPiece[]): PieceType[] {
   for (const piece of pieces) {
     const orientations = orientationsOf(piece)
     const shapeKey = orientations.map((orientation) => cellSetKey(orientation.cells)).sort()[0]
-    const key = `${piece.priority}|${piece.rotatable}|${shapeKey}`
+    const key = `${piece.tier}|${piece.rotatable}|${shapeKey}`
     const existing = types.get(key)
     if (existing) existing.pieceIds.push(piece.id)
-    else types.set(key, { pieceIds: [piece.id], size: piece.cells.length, priority: piece.priority, orientations })
+    else types.set(key, { pieceIds: [piece.id], size: piece.cells.length, tier: piece.tier, orientations })
   }
-  return [...types.values()].sort(
-    (a, b) => Number(b.priority) - Number(a.priority) || b.size - a.size,
-  )
+  return [...types.values()].sort((a, b) => a.tier - b.tier || b.size - a.size)
 }
 
 function placementsByFirstCell(board: Cell[], types: PieceType[]): TypePlacement[][][] {
@@ -116,6 +112,10 @@ function largestSubsetSumAtMost(sizes: number[], limit: number): number {
   return best
 }
 
+function sum(values: number[]): number {
+  return values.reduce((total, value) => total + value, 0)
+}
+
 function maxPiecesFitting(sizes: number[], freeCells: number): number {
   let count = 0
   let used = 0
@@ -136,17 +136,17 @@ export function solve(input: SolverInput): SolverOutput {
   const remaining = types.map((type) => type.pieceIds.length)
   const occupied = new Uint8Array(board.length)
   const stack: TypePlacement[] = []
+  const tierCount = Math.max(0, ...input.pieces.map((piece) => piece.tier + 1))
+  const placedByTier = new Array<number>(tierCount).fill(0)
 
   let freeCells = board.length
-  let priorityPlaced = 0
-  let optionalPlaced = 0
   let cellsCovered = 0
   let explored = 0
   let timedOut = false
   const best: { score: number; placements: TypePlacement[] }[] = []
 
-  const scoreOf = (priority: number, optional: number, cells: number) =>
-    priority * PRIORITY_WEIGHT + optional * OPTIONAL_WEIGHT + cells
+  const scoreOf = (countsByTier: number[], cells: number) =>
+    countsByTier.reduce((score, count) => score * TIER_BASE + count, 0) * TIER_BASE + cells
 
   const fits = (placement: TypePlacement) =>
     remaining[placement.typeIndex] > 0 && placement.cellIndices.every((index) => occupied[index] === 0)
@@ -162,28 +162,32 @@ export function solve(input: SolverInput): SolverOutput {
   const placementsOfType = types.map((_, typeIndex) => byFirstCell.flatMap((perType) => perType[typeIndex]))
 
   const upperBound = (usableCells: number, onlyPlaceableTypes: boolean): number => {
-    const prioritySizes: number[] = []
-    const optionalSizes: number[] = []
+    const sizesByTier: number[][] = placedByTier.map(() => [])
     types.forEach((type, typeIndex) => {
       if (remaining[typeIndex] === 0) return
       if (onlyPlaceableTypes && !placementsOfType[typeIndex].some(fits)) return
-      for (let copy = 0; copy < remaining[typeIndex]; copy++) {
-        ;(type.priority ? prioritySizes : optionalSizes).push(type.size)
-      }
+      for (let copy = 0; copy < remaining[typeIndex]; copy++) sizesByTier[type.tier].push(type.size)
     })
-    prioritySizes.sort((a, b) => a - b)
-    optionalSizes.sort((a, b) => a - b)
-    return scoreOf(
-      priorityPlaced + maxPiecesFitting(prioritySizes, usableCells),
-      optionalPlaced + maxPiecesFitting(optionalSizes, usableCells),
-      cellsCovered + largestSubsetSumAtMost([...prioritySizes, ...optionalSizes], usableCells),
+    let cellsLeftForTier = usableCells
+    let largestCellsAtThoseCounts = 0
+    const countsByTier = sizesByTier.map((sizes, tier) => {
+      const smallestFirst = [...sizes].sort((a, b) => a - b)
+      const count = maxPiecesFitting(smallestFirst, cellsLeftForTier)
+      cellsLeftForTier -= sum(smallestFirst.slice(0, count))
+      largestCellsAtThoseCounts += sum(smallestFirst.slice(smallestFirst.length - count))
+      return placedByTier[tier] + count
+    })
+    const cellsBound = Math.min(
+      largestSubsetSumAtMost(sizesByTier.flat(), usableCells),
+      largestCellsAtThoseCounts,
     )
+    return scoreOf(countsByTier, cellsCovered + cellsBound)
   }
 
   const worstKeptScore = () => (best.length < input.maxSolutions ? -1 : best[best.length - 1].score)
 
   const record = () => {
-    const score = scoreOf(priorityPlaced, optionalPlaced, cellsCovered)
+    const score = scoreOf(placedByTier, cellsCovered)
     if (score <= worstKeptScore()) return
     best.push({ score, placements: [...stack] })
     best.sort((a, b) => b.score - a.score)
@@ -216,15 +220,13 @@ export function solve(input: SolverInput): SolverOutput {
         remaining[typeIndex]--
         freeCells -= type.size
         cellsCovered += type.size
-        if (type.priority) priorityPlaced++
-        else optionalPlaced++
+        placedByTier[type.tier]++
         stack.push(placement)
 
         search(cell + 1)
 
         stack.pop()
-        if (type.priority) priorityPlaced--
-        else optionalPlaced--
+        placedByTier[type.tier]--
         cellsCovered -= type.size
         freeCells += type.size
         remaining[typeIndex]++
@@ -243,7 +245,7 @@ export function solve(input: SolverInput): SolverOutput {
   search(0)
 
   const piecesById = new Map(input.pieces.map((piece) => [piece.id, piece]))
-  const solutions = best.map(({ placements }) => toSolution(placements, types, board, piecesById))
+  const solutions = best.map(({ placements }) => toSolution(placements, types, board, piecesById, tierCount))
   return {
     solutions,
     complete: !timedOut,
@@ -257,6 +259,7 @@ function toSolution(
   types: PieceType[],
   board: Cell[],
   piecesById: Map<number, SolverPiece>,
+  tierCount: number,
 ): Solution {
   const nextCopy = types.map(() => 0)
   const resolved = placements.flatMap((placement) => {
@@ -264,12 +267,14 @@ function toSolution(
     const piece = piecesById.get(type.pieceIds[nextCopy[placement.typeIndex]++])
     if (!piece) return []
     const targetCells = placement.cellIndices.map((index) => board[index])
-    return [{ ...orientPiece(piece, targetCells), priority: type.priority }]
+    return [{ ...orientPiece(piece, targetCells), tier: type.tier }]
   })
   return {
     placements: resolved.map(({ pieceId, rotation, cells }) => ({ pieceId, rotation, cells })),
-    priorityPlaced: resolved.filter((placement) => placement.priority).length,
-    optionalPlaced: resolved.filter((placement) => !placement.priority).length,
+    placedByTier: Array.from(
+      { length: tierCount },
+      (_, tier) => resolved.filter((placement) => placement.tier === tier).length,
+    ),
     cellsCovered: resolved.reduce((sum, placement) => sum + placement.cells.length, 0),
   }
 }

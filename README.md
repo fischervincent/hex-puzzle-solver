@@ -6,7 +6,7 @@ Everything runs in the browser: the screenshot is never uploaded.
 
 1. Drop, choose or paste (Ctrl/⌘+V) a screenshot.
 2. Check the detected board; click cells to add or remove them, or enter columns × rows.
-3. Mark pieces as Priority / Optional / Skip, and choose which colors can rotate.
+3. Mark pieces as Mandatory / High / Medium / Optional / Skip, and choose which colors can rotate.
 4. Find placements: shows the best layouts with each piece's rotation.
 
 ## Development
