@@ -357,3 +357,42 @@ button.primary {
 .chip-missing {
   color: var(--danger);
 }
+
+.extra-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.extra-header h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.extra-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.extra-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--bg);
+  border: 1px solid var(--panel-border);
+}
+
+.extra-card .screenshot-canvas {
+  max-height: 160px;
+  border-radius: 8px;
+}
+
+.extra-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+}

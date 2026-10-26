@@ -1,9 +1,9 @@
 import { useEffect, useRef } from 'react'
 import { hexVertices, type Detection } from '../lib/detect'
 
-type Props = { bitmap: ImageBitmap; detection: Detection | null }
+type Props = { bitmap: ImageBitmap; detection: Detection | null; labels: string[]; showBoard?: boolean }
 
-export function ScreenshotPreview({ bitmap, detection }: Props) {
+export function ScreenshotPreview({ bitmap, detection, labels, showBoard = true }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
@@ -20,7 +20,7 @@ export function ScreenshotPreview({ bitmap, detection }: Props) {
     const lineWidth = Math.max(2, detection.nodeRadius * 0.12)
 
     const { lattice } = detection
-    if (lattice) {
+    if (lattice && showBoard) {
       context.strokeStyle = 'rgba(120, 220, 255, 0.9)'
       context.lineWidth = lineWidth
       for (const cell of detection.board) {
@@ -34,7 +34,7 @@ export function ScreenshotPreview({ bitmap, detection }: Props) {
       }
     }
 
-    for (const piece of detection.pieces) {
+    detection.pieces.forEach((piece, index) => {
       context.strokeStyle = piece.color
       context.lineWidth = lineWidth * 2
       for (const [a, b] of piece.shape.links) {
@@ -55,9 +55,9 @@ export function ScreenshotPreview({ bitmap, detection }: Props) {
       const top = piece.nodes.reduce((highest, node) => (node.y < highest.y ? node : highest))
       context.font = `bold ${Math.round(detection.nodeRadius * 0.9)}px system-ui, sans-serif`
       context.fillStyle = '#fff'
-      context.fillText(`#${piece.id + 1}`, top.x + detection.nodeRadius * 0.7, top.y - detection.nodeRadius * 0.6)
-    }
-  }, [bitmap, detection])
+      context.fillText(`#${labels[index]}`, top.x + detection.nodeRadius * 0.7, top.y - detection.nodeRadius * 0.6)
+    })
+  }, [bitmap, detection, labels, showBoard])
 
   return <canvas ref={canvasRef} className="screenshot-canvas" />
 }

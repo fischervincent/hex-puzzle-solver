@@ -19,7 +19,16 @@ const IMPORTANCE_LABELS: Record<Importance, string> = {
 const TIME_LIMITS = [3_000, 10_000, 30_000]
 const SOLUTION_COUNT = 6
 
-type Screenshot = { bitmap: ImageBitmap; name: string }
+type Source = {
+  key: number
+  name: string
+  bitmap: ImageBitmap
+  detection: Detection
+  detectionMs: number
+  pieceIds: number[]
+}
+
+type Piece = DetectedPiece & { label: string }
 
 async function readPixels(bitmap: ImageBitmap): Promise<ImageData> {
   const canvas = document.createElement('canvas')
@@ -29,10 +38,6 @@ async function readPixels(bitmap: ImageBitmap): Promise<ImageData> {
   if (!context) throw new Error('Canvas 2D is not available')
   context.drawImage(bitmap, 0, 0)
   return context.getImageData(0, 0, bitmap.width, bitmap.height)
-}
-
-function pieceLabel(piece: DetectedPiece): string {
-  return `${piece.id + 1}`
 }
 
 function boardRing(board: Cell[]): Cell[] {
@@ -52,9 +57,8 @@ function formatSeconds(milliseconds: number): string {
 }
 
 export default function App() {
-  const [screenshot, setScreenshot] = useState<Screenshot | null>(null)
-  const [detection, setDetection] = useState<Detection | null>(null)
-  const [detectionMs, setDetectionMs] = useState(0)
+  const [boardSource, setBoardSource] = useState<Source | null>(null)
+  const [extraSources, setExtraSources] = useState<Source[]>([])
   const [analyzing, setAnalyzing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [board, setBoard] = useState<Cell[]>(() => rectangularBoard(7, 6, FLAT_TOP_ANGLE))
@@ -67,9 +71,26 @@ export default function App() {
   const [result, setResult] = useState<{ inputKey: string; output: SolverOutput } | null>(null)
   const workerRef = useRef<Worker | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const extraFileInputRef = useRef<HTMLInputElement>(null)
+  const nextIdRef = useRef(0)
 
-  const angle = detection?.displayAngle ?? FLAT_TOP_ANGLE
-  const pieces = useMemo(() => detection?.pieces ?? [], [detection])
+  const detection = boardSource?.detection ?? null
+  const angle = detection?.displayAngle ?? extraSources[0]?.detection.displayAngle ?? FLAT_TOP_ANGLE
+  const pieces = useMemo(() => {
+    const combined: Piece[] = []
+    for (const source of boardSource ? [boardSource, ...extraSources] : extraSources) {
+      source.detection.pieces.forEach((piece, index) =>
+        combined.push({
+          ...piece,
+          id: source.pieceIds[index],
+          label: `${combined.length + 1}`,
+          boardCells: source === boardSource ? piece.boardCells : null,
+        }),
+      )
+    }
+    return combined
+  }, [boardSource, extraSources])
+  const labelById = useMemo(() => new Map(pieces.map((piece) => [piece.id, piece.label])), [pieces])
   const colorClasses = useMemo(() => groupByColor(pieces), [pieces])
   const colorClassOf = useMemo(() => {
     const byPiece = new Map<number, ColorClass>()
@@ -86,38 +107,68 @@ export default function App() {
     [colorClassOf, rotationByColor],
   )
 
-  const loadImage = useCallback(async (file: Blob, name: string) => {
-    setError(null)
-    setAnalyzing(true)
-    setResult(null)
-    try {
-      const bitmap = await createImageBitmap(file)
-      setScreenshot({ bitmap, name })
-      const pixels = await readPixels(bitmap)
-      await new Promise((resolve) => setTimeout(resolve, 20))
-      const started = performance.now()
-      const detected = detect(pixels)
-      setDetectionMs(performance.now() - started)
-      setDetection(detected)
-      setImportance({})
-      setRotationByColor({})
-      if (detected.board.length > 0) setBoard(detected.board)
-      if (detected.pieces.length === 0) setError('No colored nodes found in this image.')
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Could not read this image.')
-    } finally {
-      setAnalyzing(false)
+  const analyze = useCallback(async (file: Blob, name: string): Promise<Source> => {
+    const bitmap = await createImageBitmap(file)
+    const pixels = await readPixels(bitmap)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const started = performance.now()
+    const detected = detect(pixels)
+    return {
+      key: nextIdRef.current++,
+      name,
+      bitmap,
+      detection: detected,
+      detectionMs: performance.now() - started,
+      pieceIds: detected.pieces.map(() => nextIdRef.current++),
     }
   }, [])
+
+  const loadBoardImage = useCallback(
+    async (file: Blob, name: string) => {
+      setError(null)
+      setAnalyzing(true)
+      try {
+        const source = await analyze(file, name)
+        setBoardSource(source)
+        if (source.detection.board.length > 0) setBoard(source.detection.board)
+        if (source.detection.pieces.length === 0) setError('No colored nodes found in this image.')
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : 'Could not read this image.')
+      } finally {
+        setAnalyzing(false)
+      }
+    },
+    [analyze],
+  )
+
+  const addPieceImages = useCallback(
+    async (files: { file: Blob; name: string }[]) => {
+      setError(null)
+      setAnalyzing(true)
+      try {
+        const sources = await Promise.all(files.map(({ file, name }) => analyze(file, name)))
+        setExtraSources((current) => [...current, ...sources])
+        const empty = sources.filter((source) => source.detection.pieces.length === 0)
+        if (empty.length > 0) setError(`No colored nodes found in ${empty.map((source) => source.name).join(', ')}.`)
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : 'Could not read this image.')
+      } finally {
+        setAnalyzing(false)
+      }
+    },
+    [analyze],
+  )
 
   useEffect(() => {
     const onPaste = (event: ClipboardEvent) => {
       const file = [...(event.clipboardData?.files ?? [])].find((candidate) => candidate.type.startsWith('image/'))
-      if (file) void loadImage(file, 'pasted image')
+      if (!file) return
+      if (boardSource) void addPieceImages([{ file, name: 'pasted image' }])
+      else void loadBoardImage(file, 'pasted image')
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
-  }, [loadImage])
+  }, [boardSource, loadBoardImage, addPieceImages])
 
   useEffect(() => () => workerRef.current?.terminate(), [])
 
@@ -175,7 +226,7 @@ export default function App() {
   const boardKeys = new Set(board.map(cellKey))
   const currentLayout: DrawnPiece[] = pieces.flatMap((piece) =>
     piece.boardCells && piece.boardCells.every((cell) => boardKeys.has(cellKey(cell)))
-      ? [{ key: `${piece.id}`, cells: piece.boardCells, links: piece.shape.links, color: piece.color, label: pieceLabel(piece) }]
+      ? [{ key: `${piece.id}`, cells: piece.boardCells, links: piece.shape.links, color: piece.color, label: piece.label }]
       : [],
   )
 
@@ -203,7 +254,7 @@ export default function App() {
           onDrop={(event) => {
             event.preventDefault()
             const file = event.dataTransfer.files[0]
-            if (file) void loadImage(file, file.name)
+            if (file) void loadBoardImage(file, file.name)
           }}
         >
           <input
@@ -213,12 +264,16 @@ export default function App() {
             hidden
             onChange={(event) => {
               const file = event.target.files?.[0]
-              if (file) void loadImage(file, file.name)
+              if (file) void loadBoardImage(file, file.name)
               event.target.value = ''
             }}
           />
-          {screenshot ? (
-            <ScreenshotPreview bitmap={screenshot.bitmap} detection={detection} />
+          {boardSource ? (
+            <ScreenshotPreview
+              bitmap={boardSource.bitmap}
+              detection={boardSource.detection}
+              labels={boardSource.pieceIds.map((id) => labelById.get(id) ?? '')}
+            />
           ) : (
             <div className="dropzone-empty">
               <strong>Click to choose, drop an image, or paste (Ctrl/⌘+V)</strong>
@@ -226,15 +281,63 @@ export default function App() {
             </div>
           )}
         </div>
-        {analyzing && <p className="status">Analyzing…</p>}
-        {error && <p className="status status-error">{error}</p>}
-        {detection && !analyzing && (
+        {boardSource && (
           <p className="status">
-            Found <strong>{detection.pieces.length} pieces</strong> and{' '}
-            <strong>{detection.board.length} board cells</strong> in {formatSeconds(detectionMs)}. Click the image to
-            load another.
+            Found <strong>{boardSource.detection.pieces.length} pieces</strong> and{' '}
+            <strong>{boardSource.detection.board.length} board cells</strong> in{' '}
+            {formatSeconds(boardSource.detectionMs)}. Click the image to replace it.
           </p>
         )}
+
+        <div className="extra-header">
+          <h3>More pieces</h3>
+          <button type="button" onClick={() => extraFileInputRef.current?.click()}>
+            Add pictures
+          </button>
+          <input
+            ref={extraFileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            hidden
+            onChange={(event) => {
+              const files = [...(event.target.files ?? [])].map((file) => ({ file, name: file.name }))
+              if (files.length > 0) void addPieceImages(files)
+              event.target.value = ''
+            }}
+          />
+        </div>
+        <p className="hint">
+          Every node group found in these pictures is added as an extra piece. Only the first screenshot sets the
+          board. {boardSource && 'Pasting now adds a picture here.'}
+        </p>
+        {extraSources.length > 0 && (
+          <div className="extra-grid">
+            {extraSources.map((source) => (
+              <article key={source.key} className="extra-card">
+                <ScreenshotPreview
+                  bitmap={source.bitmap}
+                  detection={source.detection}
+                  labels={source.pieceIds.map((id) => labelById.get(id) ?? '')}
+                  showBoard={false}
+                />
+                <div className="extra-meta">
+                  <span className="muted" title={source.name}>
+                    {source.detection.pieces.length} pieces
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setExtraSources((current) => current.filter((other) => other.key !== source.key))}
+                  >
+                    Remove
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+        {analyzing && <p className="status">Analyzing…</p>}
+        {error && <p className="status status-error">{error}</p>}
       </section>
 
       <section className="panel">
@@ -316,14 +419,14 @@ export default function App() {
                         cells: piece.shape.cells,
                         links: piece.shape.links,
                         color: piece.color,
-                        label: pieceLabel(piece),
+                        label: piece.label,
                       }}
                     />
                   </div>
                   <div className="piece-meta">
-                    <strong>#{pieceLabel(piece)}</strong>
+                    <strong>#{piece.label}</strong>
                     <span className="muted">
-                      {piece.shape.cells.length} cells · {piece.boardCells ? 'on board' : 'loose'}
+                      {piece.shape.cells.length} cells · {piece.boardCells ? 'on board' : 'extra'}
                       {canRotate(piece) ? '' : ' · fixed'}
                     </span>
                   </div>
@@ -402,7 +505,7 @@ type SolutionListProps = {
   stale: boolean
   board: Cell[]
   angle: number
-  piecesById: Map<number, DetectedPiece>
+  piecesById: Map<number, Piece>
   consideredIds: number[]
   priorityTotal: number
   optionalTotal: number
@@ -432,7 +535,7 @@ type SolutionCardProps = {
   solution: Solution
   board: Cell[]
   angle: number
-  piecesById: Map<number, DetectedPiece>
+  piecesById: Map<number, Piece>
   consideredIds: number[]
   priorityTotal: number
   optionalTotal: number
@@ -443,7 +546,7 @@ function SolutionCard(props: SolutionCardProps) {
   const drawn: DrawnPiece[] = solution.placements.flatMap((placement) => {
     const piece = piecesById.get(placement.pieceId)
     return piece
-      ? [{ key: `${piece.id}`, cells: placement.cells, links: piece.shape.links, color: piece.color, label: pieceLabel(piece) }]
+      ? [{ key: `${piece.id}`, cells: placement.cells, links: piece.shape.links, color: piece.color, label: piece.label }]
       : []
   })
   const placedIds = new Set(solution.placements.map((placement) => placement.pieceId))
@@ -466,12 +569,12 @@ function SolutionCard(props: SolutionCardProps) {
           .sort((a, b) => a.pieceId - b.pieceId)
           .map((placement) => (
             <span key={placement.pieceId} className="chip">
-              #{placement.pieceId + 1} {placement.rotation === 0 ? 'no rotation' : `↻ ${placement.rotation * 60}°`}
+              #{piecesById.get(placement.pieceId)?.label} {placement.rotation === 0 ? 'no rotation' : `↻ ${placement.rotation * 60}°`}
             </span>
           ))}
         {unplacedIds.map((id) => (
           <span key={id} className="chip chip-missing">
-            #{id + 1} not placed
+            #{piecesById.get(id)?.label} not placed
           </span>
         ))}
       </div>
