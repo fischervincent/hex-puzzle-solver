@@ -1,24 +1,28 @@
-import { addCells, cellKey, cellSetKey, rotateShapeCells, type Cell } from './hex'
+import { HEX_NEIGHBORS, addCells, cellKey, cellSetKey, rotateShapeCells, type Cell } from './hex'
 
 export type SolverPiece = {
   id: number
   cells: Cell[]
   rotatable: boolean
   tier: number
+  wantsNeighbors: boolean
+  avoidEdge: boolean
 }
 
 export type SolverInput = {
   board: Cell[]
+  edgeCells: Cell[]
   pieces: SolverPiece[]
   maxSolutions: number
   timeLimitMs: number
 }
 
-export type Placement = { pieceId: number; rotation: number; cells: Cell[] }
+export type Placement = { pieceId: number; rotation: number; cells: Cell[]; neighborCount: number | null }
 
 export type Solution = {
   placements: Placement[]
   placedByTier: number[]
+  neighborScore: number
   cellsCovered: number
 }
 
@@ -35,13 +39,26 @@ type PieceType = {
   pieceIds: number[]
   size: number
   tier: number
+  wantsNeighbors: boolean
+  avoidEdge: boolean
   orientations: Orientation[]
 }
 
 type TypePlacement = { typeIndex: number; rotation: number; cellIndices: number[] }
 
-const TIER_BASE = 1_000
+type Score = number[]
+
 const CLOCK_CHECK_INTERVAL = 4096
+const FREE = 0
+const FILLED = 1
+const LEFT_EMPTY = 2
+
+function compareScores(a: Score, b: Score): number {
+  for (let index = 0; index < a.length; index++) {
+    if (a[index] !== b[index]) return a[index] - b[index]
+  }
+  return 0
+}
 
 function orientationsOf(piece: SolverPiece): Orientation[] {
   const steps = piece.rotatable ? [0, 1, 2, 3, 4, 5] : [0]
@@ -60,15 +77,25 @@ function groupIntoTypes(pieces: SolverPiece[]): PieceType[] {
   for (const piece of pieces) {
     const orientations = orientationsOf(piece)
     const shapeKey = orientations.map((orientation) => cellSetKey(orientation.cells)).sort()[0]
-    const key = `${piece.tier}|${piece.rotatable}|${shapeKey}`
+    const key = [piece.tier, piece.rotatable, piece.wantsNeighbors, piece.avoidEdge, shapeKey].join('|')
     const existing = types.get(key)
     if (existing) existing.pieceIds.push(piece.id)
-    else types.set(key, { pieceIds: [piece.id], size: piece.cells.length, tier: piece.tier, orientations })
+    else
+      types.set(key, {
+        pieceIds: [piece.id],
+        size: piece.cells.length,
+        tier: piece.tier,
+        wantsNeighbors: piece.wantsNeighbors,
+        avoidEdge: piece.avoidEdge,
+        orientations,
+      })
   }
-  return [...types.values()].sort((a, b) => a.tier - b.tier || b.size - a.size)
+  return [...types.values()].sort(
+    (a, b) => a.tier - b.tier || Number(b.wantsNeighbors) - Number(a.wantsNeighbors) || b.size - a.size,
+  )
 }
 
-function placementsByFirstCell(board: Cell[], types: PieceType[]): TypePlacement[][][] {
+function placementsByFirstCell(board: Cell[], edgeKeys: Set<string>, types: PieceType[]): TypePlacement[][][] {
   const indexByKey = new Map(board.map((cell, index) => [cellKey(cell), index]))
   const byFirstCell: TypePlacement[][][] = board.map(() => types.map(() => []))
 
@@ -77,7 +104,9 @@ function placementsByFirstCell(board: Cell[], types: PieceType[]): TypePlacement
     for (const orientation of type.orientations) {
       for (const anchor of board) {
         const offset = { i: anchor.i - orientation.cells[0].i, j: anchor.j - orientation.cells[0].j }
-        const cellIndices = orientation.cells.map((cell) => indexByKey.get(cellKey(addCells(cell, offset))))
+        const placed = orientation.cells.map((cell) => addCells(cell, offset))
+        if (type.avoidEdge && placed.some((cell) => edgeKeys.has(cellKey(cell)))) continue
+        const cellIndices = placed.map((cell) => indexByKey.get(cellKey(cell)))
         if (cellIndices.some((index) => index === undefined)) continue
         const indices = cellIndices.filter((index): index is number => index !== undefined)
         const key = [...indices].sort((a, b) => a - b).join(',')
@@ -96,6 +125,16 @@ function placementsCoveringEachCell(cellCount: number, byFirstCell: TypePlacemen
     for (const index of placement.cellIndices) covering[index].push(placement)
   }
   return covering
+}
+
+function neighborIndicesOf(board: Cell[]): number[][] {
+  const indexByKey = new Map(board.map((cell, index) => [cellKey(cell), index]))
+  return board.map((cell) =>
+    HEX_NEIGHBORS.flatMap((direction) => {
+      const index = indexByKey.get(cellKey(addCells(cell, direction)))
+      return index === undefined ? [] : [index]
+    }),
+  )
 }
 
 function largestSubsetSumAtMost(sizes: number[], limit: number): number {
@@ -131,37 +170,72 @@ export function solve(input: SolverInput): SolverOutput {
   const started = performance.now()
   const board = [...input.board].sort((a, b) => a.i - b.i || a.j - b.j)
   const types = groupIntoTypes(input.pieces)
-  const byFirstCell = placementsByFirstCell(board, types)
+  const byFirstCell = placementsByFirstCell(board, new Set(input.edgeCells.map(cellKey)), types)
   const coveringPlacements = placementsCoveringEachCell(board.length, byFirstCell)
+  const placementsOfType = types.map((_, typeIndex) => byFirstCell.flatMap((perType) => perType[typeIndex]))
+  const neighborIndices = neighborIndicesOf(board)
   const remaining = types.map((type) => type.pieceIds.length)
   const occupied = new Uint8Array(board.length)
+  const owner = new Int32Array(board.length).fill(-1)
   const stack: TypePlacement[] = []
   const tierCount = Math.max(0, ...input.pieces.map((piece) => piece.tier + 1))
   const placedByTier = new Array<number>(tierCount).fill(0)
+  const otherPiecesMax = Math.max(0, input.pieces.length - 1)
 
   let freeCells = board.length
   let cellsCovered = 0
   let explored = 0
   let timedOut = false
-  const best: { score: number; placements: TypePlacement[] }[] = []
-
-  const scoreOf = (countsByTier: number[], cells: number) =>
-    countsByTier.reduce((score, count) => score * TIER_BASE + count, 0) * TIER_BASE + cells
+  const best: { score: Score; placements: TypePlacement[] }[] = []
 
   const fits = (placement: TypePlacement) =>
-    remaining[placement.typeIndex] > 0 && placement.cellIndices.every((index) => occupied[index] === 0)
+    remaining[placement.typeIndex] > 0 && placement.cellIndices.every((index) => occupied[index] === FREE)
 
   const countUncoverableCells = (): number => {
     let uncoverable = 0
     for (let index = 0; index < board.length; index++) {
-      if (occupied[index] === 0 && !coveringPlacements[index].some(fits)) uncoverable++
+      if (occupied[index] === FREE && !coveringPlacements[index].some(fits)) uncoverable++
     }
     return uncoverable
   }
 
-  const placementsOfType = types.map((_, typeIndex) => byFirstCell.flatMap((perType) => perType[typeIndex]))
+  const neighborsOfPlacement = (stackIndex: number): { touching: number; undecided: number } => {
+    const touching = new Set<number>()
+    let undecided = 0
+    const seenCells = new Set<number>()
+    for (const cell of stack[stackIndex].cellIndices) {
+      for (const neighbor of neighborIndices[cell]) {
+        if (seenCells.has(neighbor)) continue
+        seenCells.add(neighbor)
+        if (owner[neighbor] >= 0 && owner[neighbor] !== stackIndex) touching.add(owner[neighbor])
+        else if (occupied[neighbor] === FREE) undecided++
+      }
+    }
+    return { touching: touching.size, undecided }
+  }
 
-  const upperBound = (usableCells: number, onlyPlaceableTypes: boolean): number => {
+  const neighborScoreBound = (): number => {
+    const piecesLeft = sum(remaining)
+    let bound = 0
+    stack.forEach((placement, stackIndex) => {
+      if (!types[placement.typeIndex].wantsNeighbors) return
+      const { touching, undecided } = neighborsOfPlacement(stackIndex)
+      bound += touching + Math.min(undecided, piecesLeft)
+    })
+    types.forEach((type, typeIndex) => {
+      if (type.wantsNeighbors) bound += remaining[typeIndex] * otherPiecesMax
+    })
+    return bound
+  }
+
+  const currentNeighborScore = (): number =>
+    sum(
+      stack.map((placement, stackIndex) =>
+        types[placement.typeIndex].wantsNeighbors ? neighborsOfPlacement(stackIndex).touching : 0,
+      ),
+    )
+
+  const upperBound = (usableCells: number, onlyPlaceableTypes: boolean): Score => {
     const sizesByTier: number[][] = placedByTier.map(() => [])
     types.forEach((type, typeIndex) => {
       if (remaining[typeIndex] === 0) return
@@ -177,20 +251,18 @@ export function solve(input: SolverInput): SolverOutput {
       largestCellsAtThoseCounts += sum(smallestFirst.slice(smallestFirst.length - count))
       return placedByTier[tier] + count
     })
-    const cellsBound = Math.min(
-      largestSubsetSumAtMost(sizesByTier.flat(), usableCells),
-      largestCellsAtThoseCounts,
-    )
-    return scoreOf(countsByTier, cellsCovered + cellsBound)
+    const cellsBound = Math.min(largestSubsetSumAtMost(sizesByTier.flat(), usableCells), largestCellsAtThoseCounts)
+    return [...countsByTier, neighborScoreBound(), cellsCovered + cellsBound]
   }
 
-  const worstKeptScore = () => (best.length < input.maxSolutions ? -1 : best[best.length - 1].score)
+  const cannotBeatKept = (bound: Score): boolean =>
+    best.length >= input.maxSolutions && compareScores(bound, best[best.length - 1].score) <= 0
 
   const record = () => {
-    const score = scoreOf(placedByTier, cellsCovered)
-    if (score <= worstKeptScore()) return
+    const score = [...placedByTier, currentNeighborScore(), cellsCovered]
+    if (cannotBeatKept(score)) return
     best.push({ score, placements: [...stack] })
-    best.sort((a, b) => b.score - a.score)
+    best.sort((a, b) => compareScores(b.score, a.score))
     if (best.length > input.maxSolutions) best.pop()
   }
 
@@ -204,8 +276,8 @@ export function solve(input: SolverInput): SolverOutput {
 
     let cell = start
     while (cell < board.length && occupied[cell]) cell++
-    if (upperBound(freeCells, false) <= worstKeptScore()) return
-    if (upperBound(freeCells - countUncoverableCells(), true) <= worstKeptScore()) return
+    if (cannotBeatKept(upperBound(freeCells, false))) return
+    if (cannotBeatKept(upperBound(freeCells - countUncoverableCells(), true))) return
     if (cell === board.length) {
       record()
       return
@@ -216,7 +288,11 @@ export function solve(input: SolverInput): SolverOutput {
       const type = types[typeIndex]
       for (const placement of byFirstCell[cell][typeIndex]) {
         if (placement.cellIndices.some((index) => occupied[index])) continue
-        for (const index of placement.cellIndices) occupied[index] = 1
+        const stackIndex = stack.length
+        for (const index of placement.cellIndices) {
+          occupied[index] = FILLED
+          owner[index] = stackIndex
+        }
         remaining[typeIndex]--
         freeCells -= type.size
         cellsCovered += type.size
@@ -230,22 +306,79 @@ export function solve(input: SolverInput): SolverOutput {
         cellsCovered -= type.size
         freeCells += type.size
         remaining[typeIndex]++
-        for (const index of placement.cellIndices) occupied[index] = 0
+        for (const index of placement.cellIndices) {
+          occupied[index] = FREE
+          owner[index] = -1
+        }
         if (timedOut) return
       }
     }
 
-    occupied[cell] = 2
+    occupied[cell] = LEFT_EMPTY
     freeCells--
     search(cell + 1)
     freeCells++
-    occupied[cell] = 0
+    occupied[cell] = FREE
   }
 
-  search(0)
+  const boardNeighborCount = (placement: TypePlacement): number => {
+    const inside = new Set(placement.cellIndices)
+    const around = new Set(placement.cellIndices.flatMap((index) => neighborIndices[index]))
+    return [...around].filter((index) => !inside.has(index)).length
+  }
+  const boosterCopies = types.flatMap((type, typeIndex) =>
+    type.wantsNeighbors ? type.pieceIds.map(() => typeIndex) : [],
+  )
+  const boosterPlacements = types.map((_, typeIndex) =>
+    [...placementsOfType[typeIndex]].sort((a, b) => boardNeighborCount(b) - boardNeighborCount(a)),
+  )
+
+  const placeBoostersThenSearch = (copy: number): void => {
+    if (timedOut) return
+    if (cannotBeatKept(upperBound(freeCells, false))) return
+    if (copy === boosterCopies.length) {
+      search(0)
+      return
+    }
+    const typeIndex = boosterCopies[copy]
+    const type = types[typeIndex]
+    for (const placement of boosterPlacements[typeIndex]) {
+      if (!fits(placement)) continue
+      const stackIndex = stack.length
+      for (const index of placement.cellIndices) {
+        occupied[index] = FILLED
+        owner[index] = stackIndex
+      }
+      remaining[typeIndex]--
+      freeCells -= type.size
+      cellsCovered += type.size
+      placedByTier[type.tier]++
+      stack.push(placement)
+
+      placeBoostersThenSearch(copy + 1)
+
+      stack.pop()
+      placedByTier[type.tier]--
+      cellsCovered -= type.size
+      freeCells += type.size
+      remaining[typeIndex]++
+      for (const index of placement.cellIndices) {
+        occupied[index] = FREE
+        owner[index] = -1
+      }
+      if (timedOut) return
+    }
+    remaining[typeIndex]--
+    placeBoostersThenSearch(copy + 1)
+    remaining[typeIndex]++
+  }
+
+  placeBoostersThenSearch(0)
 
   const piecesById = new Map(input.pieces.map((piece) => [piece.id, piece]))
-  const solutions = best.map(({ placements }) => toSolution(placements, types, board, piecesById, tierCount))
+  const solutions = best.map(({ placements }) =>
+    toSolution(placements, types, board, neighborIndices, piecesById, tierCount),
+  )
   return {
     solutions,
     complete: !timedOut,
@@ -258,28 +391,46 @@ function toSolution(
   placements: TypePlacement[],
   types: PieceType[],
   board: Cell[],
+  neighborIndices: number[][],
   piecesById: Map<number, SolverPiece>,
   tierCount: number,
 ): Solution {
+  const ownerByCell = new Map<number, number>()
+  placements.forEach((placement, stackIndex) => {
+    for (const index of placement.cellIndices) ownerByCell.set(index, stackIndex)
+  })
+  const neighborCountOf = (stackIndex: number): number => {
+    const touching = new Set<number>()
+    for (const cell of placements[stackIndex].cellIndices) {
+      for (const neighbor of neighborIndices[cell]) {
+        const neighborOwner = ownerByCell.get(neighbor)
+        if (neighborOwner !== undefined && neighborOwner !== stackIndex) touching.add(neighborOwner)
+      }
+    }
+    return touching.size
+  }
+
   const nextCopy = types.map(() => 0)
-  const resolved = placements.flatMap((placement) => {
+  const resolved = placements.flatMap((placement, stackIndex) => {
     const type = types[placement.typeIndex]
     const piece = piecesById.get(type.pieceIds[nextCopy[placement.typeIndex]++])
     if (!piece) return []
     const targetCells = placement.cellIndices.map((index) => board[index])
-    return [{ ...orientPiece(piece, targetCells), tier: type.tier }]
+    const neighborCount = type.wantsNeighbors ? neighborCountOf(stackIndex) : null
+    return [{ ...orientPiece(piece, targetCells), neighborCount, tier: type.tier }]
   })
   return {
-    placements: resolved.map(({ pieceId, rotation, cells }) => ({ pieceId, rotation, cells })),
+    placements: resolved.map(({ pieceId, rotation, cells, neighborCount }) => ({ pieceId, rotation, cells, neighborCount })),
     placedByTier: Array.from(
       { length: tierCount },
       (_, tier) => resolved.filter((placement) => placement.tier === tier).length,
     ),
-    cellsCovered: resolved.reduce((sum, placement) => sum + placement.cells.length, 0),
+    neighborScore: sum(resolved.map((placement) => placement.neighborCount ?? 0)),
+    cellsCovered: sum(resolved.map((placement) => placement.cells.length)),
   }
 }
 
-function orientPiece(piece: SolverPiece, targetCells: Cell[]): Placement {
+function orientPiece(piece: SolverPiece, targetCells: Cell[]): Omit<Placement, 'neighborCount'> {
   const targetKey = cellSetKey(targetCells)
   const offset = {
     i: Math.min(...targetCells.map((cell) => cell.i)),

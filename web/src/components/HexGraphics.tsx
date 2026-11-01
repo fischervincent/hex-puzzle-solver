@@ -74,14 +74,23 @@ type BoardViewProps = {
   angleDeg: number
   pieces?: DrawnPiece[]
   candidates?: Cell[]
+  highlighted?: Cell[]
   onToggleCell?: (cell: Cell) => void
 }
 
 const BOARD_HEX_SIZE = 20
 
-export function BoardView({ board, angleDeg, pieces = [], candidates = [], onToggleCell }: BoardViewProps) {
+export function BoardView({
+  board,
+  angleDeg,
+  pieces = [],
+  candidates = [],
+  highlighted = [],
+  onToggleCell,
+}: BoardViewProps) {
   const size = BOARD_HEX_SIZE
   const editable = onToggleCell !== undefined
+  const highlightedKeys = new Set(highlighted.map(cellKey))
   return (
     <svg className="board-svg" viewBox={viewBoxOf(boundsAround([...board, ...candidates], size, angleDeg))}>
       {candidates.map((cell) => (
@@ -95,7 +104,9 @@ export function BoardView({ board, angleDeg, pieces = [], candidates = [], onTog
       {board.map((cell) => (
         <polygon
           key={`cell-${cellKey(cell)}`}
-          className={editable ? 'cell cell-editable' : 'cell'}
+          className={['cell', editable && 'cell-editable', highlightedKeys.has(cellKey(cell)) && 'cell-highlighted']
+            .filter(Boolean)
+            .join(' ')}
           points={hexPoints(cellCenter(cell, size, angleDeg), size * 0.9, angleDeg)}
           strokeWidth={size * 0.1}
           onClick={() => onToggleCell?.(cell)}

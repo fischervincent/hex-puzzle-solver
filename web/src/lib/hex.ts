@@ -58,6 +58,19 @@ export function rectangularBoard(columns: number, rows: number, angleDeg: number
   return cells
 }
 
+export function offsetPosition(cell: Cell, angleDeg: number): { column: number; row: number } {
+  return angleDeg === FLAT_TOP_ANGLE
+    ? { column: cell.i, row: cell.j + Math.floor(cell.i / 2) }
+    : { column: cell.i + Math.floor(cell.j / 2), row: cell.j }
+}
+
+export function lastRowAndColumnCells(board: Cell[], angleDeg: number): Cell[] {
+  const positions = board.map((cell) => offsetPosition(cell, angleDeg))
+  const lastColumn = Math.max(...positions.map((position) => position.column))
+  const lastRow = Math.max(...positions.map((position) => position.row))
+  return board.filter((_, index) => positions[index].column === lastColumn || positions[index].row === lastRow)
+}
+
 export function latticeVectors(size: number, angleDeg: number): [Point, Point] {
   const step = Math.sqrt(3) * size
   const a = (angleDeg * Math.PI) / 180

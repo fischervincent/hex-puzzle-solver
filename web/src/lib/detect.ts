@@ -46,6 +46,7 @@ export type DetectedPiece = {
   hue: number
   color: string
   nodes: DetectedNode[]
+  latticeCells: Cell[]
   boardCells: Cell[] | null
 }
 
@@ -518,6 +519,7 @@ function buildPiece(
   })
 
   const absolute = members.map((node) => latticeCoordinates(lattice, node))
+  const anchor = { i: Math.round(absolute[0].i), j: Math.round(absolute[0].j) }
   const isOnBoard = absolute.every(
     (coords) =>
       Math.hypot(coords.i - Math.round(coords.i), coords.j - Math.round(coords.j)) <= MAX_ON_BOARD_RESIDUAL &&
@@ -533,6 +535,7 @@ function buildPiece(
     hue: ((Math.atan2(hueY, hueX) * 180) / Math.PI + 360) % 360,
     color: members[0].color,
     nodes: members,
+    latticeCells: relative.map((cell) => addCells(cell, anchor)),
     boardCells: isOnBoard
       ? absolute.map((coords) => ({ i: Math.round(coords.i), j: Math.round(coords.j) }))
       : null,

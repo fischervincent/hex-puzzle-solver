@@ -3,7 +3,17 @@ import { BoardView, PieceView, type DrawnPiece } from './components/HexGraphics'
 import { ScreenshotPreview } from './components/ScreenshotPreview'
 import { groupByColor, type ColorClass } from './lib/colors'
 import { detect, type DetectedPiece, type Detection } from './lib/detect'
-import { FLAT_TOP_ANGLE, HEX_NEIGHBORS, addCells, cellKey, rectangularBoard, type Cell } from './lib/hex'
+import {
+  FLAT_TOP_ANGLE,
+  HEX_NEIGHBORS,
+  addCells,
+  cellKey,
+  lastRowAndColumnCells,
+  rectangularBoard,
+  translateToOrigin,
+  type Cell,
+  type Link,
+} from './lib/hex'
 import type { Solution, SolverInput, SolverOutput } from './lib/solver'
 
 type Importance = 'mandatory' | 'high' | 'medium' | 'optional' | 'skip'
@@ -32,7 +42,26 @@ type Source = {
   pieceIds: number[]
 }
 
-type Piece = DetectedPiece & { label: string }
+type Piece = DetectedPiece & { label: string; sourceKey: number; partIds: number[] }
+
+function linkParts(parts: Piece[]): Piece {
+  let offset = 0
+  const links: Link[] = parts.flatMap((part) => {
+    const shifted = part.shape.links.map(([a, b]): Link => [a + offset, b + offset])
+    offset += part.latticeCells.length
+    return shifted
+  })
+  const latticeCells = parts.flatMap((part) => part.latticeCells)
+  return {
+    ...parts[0],
+    label: parts.map((part) => part.label).join('+'),
+    shape: { cells: translateToOrigin(latticeCells), links },
+    nodes: parts.flatMap((part) => part.nodes),
+    latticeCells,
+    boardCells: parts.every((part) => part.boardCells) ? parts.flatMap((part) => part.boardCells ?? []) : null,
+    partIds: parts.map((part) => part.id),
+  }
+}
 
 async function readPixels(bitmap: ImageBitmap): Promise<ImageData> {
   const canvas = document.createElement('canvas')
@@ -79,6 +108,10 @@ export default function App() {
   const [rows, setRows] = useState(6)
   const [importance, setImportance] = useState<Record<number, Importance>>({})
   const [rotationByColor, setRotationByColor] = useState<Record<string, boolean>>({})
+  const [avoidEdgeByColor, setAvoidEdgeByColor] = useState<Record<string, boolean>>({})
+  const [wantsNeighbors, setWantsNeighbors] = useState<Record<number, boolean>>({})
+  const [linkGroups, setLinkGroups] = useState<number[][]>([])
+  const [selectedForLink, setSelectedForLink] = useState<number[]>([])
   const [timeLimit, setTimeLimit] = useState(10_000)
   const [solving, setSolving] = useState(false)
   const [result, setResult] = useState<{ inputKey: string; output: SolverOutput } | null>(null)
@@ -89,7 +122,7 @@ export default function App() {
 
   const detection = boardSource?.detection ?? null
   const angle = detection?.displayAngle ?? extraSources[0]?.detection.displayAngle ?? FLAT_TOP_ANGLE
-  const pieces = useMemo(() => {
+  const detectedPieces = useMemo(() => {
     const combined: Piece[] = []
     for (const source of boardSource ? [boardSource, ...extraSources] : extraSources) {
       source.detection.pieces.forEach((piece, index) =>
@@ -98,12 +131,29 @@ export default function App() {
           id: source.pieceIds[index],
           label: `${combined.length + 1}`,
           boardCells: source === boardSource ? piece.boardCells : null,
+          sourceKey: source.key,
+          partIds: [source.pieceIds[index]],
         }),
       )
     }
     return combined
   }, [boardSource, extraSources])
-  const labelById = useMemo(() => new Map(pieces.map((piece) => [piece.id, piece.label])), [pieces])
+  const labelById = useMemo(() => new Map(detectedPieces.map((piece) => [piece.id, piece.label])), [detectedPieces])
+  const pieces = useMemo(() => {
+    const byId = new Map(detectedPieces.map((piece) => [piece.id, piece]))
+    const linked = new Map<number, Piece>()
+    for (const group of linkGroups) {
+      const parts = group.flatMap((id) => byId.get(id) ?? [])
+      if (parts.length < 2) continue
+      for (const part of parts) linked.set(part.id, parts[0])
+      linked.set(parts[0].id, linkParts(parts))
+    }
+    return detectedPieces.flatMap((piece) => {
+      const replacement = linked.get(piece.id)
+      if (!replacement) return [piece]
+      return replacement.id === piece.id ? [replacement] : []
+    })
+  }, [detectedPieces, linkGroups])
   const colorClasses = useMemo(() => groupByColor(pieces), [pieces])
   const colorClassOf = useMemo(() => {
     const byPiece = new Map<number, ColorClass>()
@@ -119,6 +169,34 @@ export default function App() {
     },
     [colorClassOf, rotationByColor],
   )
+  const avoidsEdgeByDefault = (colorClass: ColorClass) => colorClass.name === 'Red'
+  const avoidsEdge = useCallback(
+    (piece: DetectedPiece) => {
+      const colorClass = colorClassOf.get(piece.id)
+      return colorClass ? (avoidEdgeByColor[colorClass.id] ?? avoidsEdgeByDefault(colorClass)) : false
+    },
+    [colorClassOf, avoidEdgeByColor],
+  )
+
+  const linkSelected = () => {
+    const selectedPieces = pieces.filter((piece) => selectedForLink.includes(piece.id))
+    if (new Set(selectedPieces.map((piece) => piece.sourceKey)).size > 1) {
+      setError('Only pieces from the same picture can be linked, so their spacing is known.')
+      return
+    }
+    const partIds = selectedPieces.flatMap((piece) => piece.partIds)
+    setLinkGroups((current) => [...current.filter((group) => !group.some((id) => partIds.includes(id))), partIds])
+    setSelectedForLink([])
+    setError(null)
+  }
+
+  const unlink = (piece: Piece) =>
+    setLinkGroups((current) => current.filter((group) => !group.includes(piece.id)))
+
+  const toggleLinkSelection = (piece: Piece) =>
+    setSelectedForLink((current) =>
+      current.includes(piece.id) ? current.filter((id) => id !== piece.id) : [...current, piece.id],
+    )
 
   const analyze = useCallback(async (file: Blob, name: string): Promise<Source> => {
     const bitmap = await createImageBitmap(file)
@@ -185,9 +263,11 @@ export default function App() {
 
   useEffect(() => () => workerRef.current?.terminate(), [])
 
+  const edgeCells = useMemo(() => (board.length > 0 ? lastRowAndColumnCells(board, angle) : []), [board, angle])
   const solverInput = useMemo<SolverInput>(
     () => ({
       board,
+      edgeCells,
       pieces: pieces
         .filter((piece) => importanceOf(piece) !== 'skip')
         .map((piece) => ({
@@ -195,11 +275,13 @@ export default function App() {
           cells: piece.shape.cells,
           rotatable: canRotate(piece),
           tier: RANKED_LEVELS.indexOf(importanceOf(piece)),
+          wantsNeighbors: wantsNeighbors[piece.id] ?? false,
+          avoidEdge: avoidsEdge(piece),
         })),
       maxSolutions: SOLUTION_COUNT,
       timeLimitMs: timeLimit,
     }),
-    [board, pieces, importanceOf, canRotate, timeLimit],
+    [board, edgeCells, pieces, importanceOf, canRotate, avoidsEdge, wantsNeighbors, timeLimit],
   )
   const solverInputKey = useMemo(() => JSON.stringify(solverInput), [solverInput])
 
@@ -247,6 +329,7 @@ export default function App() {
   const resultIsStale = result !== null && result.inputKey !== solverInputKey
   const totalsByTier = RANKED_LEVELS.map((_, tier) => solverInput.pieces.filter((piece) => piece.tier === tier).length)
   const pieceCells = solverInput.pieces.reduce((sum, piece) => sum + piece.cells.length, 0)
+  const someAvoidEdge = solverInput.pieces.some((piece) => piece.avoidEdge)
 
   return (
     <div className="app">
@@ -357,12 +440,16 @@ export default function App() {
           <span className="step">2</span> Board
           <span className="panel-meta">{board.length} cells</span>
         </h2>
-        <p className="hint">Click a cell to remove it, or click a dashed cell to add it.</p>
+        <p className="hint">
+          Click a cell to remove it, or click a dashed cell to add it.
+          {someAvoidEdge && ' Red-tinted cells are the last row and column, which some pieces avoid.'}
+        </p>
         <div className="board-editor">
           <BoardView
             board={board}
             angleDeg={angle}
             pieces={currentLayout}
+            highlighted={someAvoidEdge ? edgeCells : []}
             candidates={boardRing(board)}
             onToggleCell={toggleCell}
           />
@@ -417,12 +504,32 @@ export default function App() {
                     }
                   />
                   can rotate
+                  <input
+                    type="checkbox"
+                    checked={avoidEdgeByColor[colorClass.id] ?? avoidsEdgeByDefault(colorClass)}
+                    onChange={(event) =>
+                      setAvoidEdgeByColor((current) => ({ ...current, [colorClass.id]: event.target.checked }))
+                    }
+                  />
+                  keep off last row/column
                 </label>
               ))}
             </div>
+            <div className="link-bar">
+              <span className="muted">
+                Some upgrades are several separate node groups. Tick them (same picture) and link them to keep their
+                spacing.
+              </span>
+              <button type="button" disabled={selectedForLink.length < 2} onClick={linkSelected}>
+                Link selected ({selectedForLink.length})
+              </button>
+            </div>
             <div className="piece-grid">
               {pieces.map((piece) => (
-                <article key={piece.id} className={`piece-card piece-${importanceOf(piece)}`}>
+                <article
+                  key={piece.id}
+                  className={`piece-card piece-${importanceOf(piece)}${selectedForLink.includes(piece.id) ? ' piece-selected' : ''}`}
+                >
                   <div className="piece-preview">
                     <PieceView
                       angleDeg={angle}
@@ -441,6 +548,32 @@ export default function App() {
                       {piece.shape.cells.length} cells · {piece.boardCells ? 'on board' : 'loose'}
                       {canRotate(piece) ? '' : ' · fixed'}
                     </span>
+                  </div>
+                  <div className="piece-options">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={wantsNeighbors[piece.id] ?? false}
+                        onChange={(event) =>
+                          setWantsNeighbors((current) => ({ ...current, [piece.id]: event.target.checked }))
+                        }
+                      />
+                      Wants neighbors
+                    </label>
+                    {piece.partIds.length > 1 ? (
+                      <button type="button" className="small" onClick={() => unlink(piece)}>
+                        Unlink
+                      </button>
+                    ) : (
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={selectedForLink.includes(piece.id)}
+                          onChange={() => toggleLinkSelection(piece)}
+                        />
+                        Link
+                      </label>
+                    )}
                   </div>
                   <select
                     className="importance-select"
@@ -573,7 +706,10 @@ function SolutionCard(props: SolutionCardProps) {
       <header>
         <strong>Option {index + 1}</strong>
         <span className="muted">
-          {tierSummary(totalsByTier, solution.placedByTier)} · {solution.cellsCovered}/{board.length} cells
+          {tierSummary(totalsByTier, solution.placedByTier)}
+          {solution.placements.some((placement) => placement.neighborCount !== null) &&
+            ` · ${solution.neighborScore} neighbors`}{' '}
+          · {solution.cellsCovered}/{board.length} cells
         </span>
       </header>
       <BoardView board={board} angleDeg={angle} pieces={drawn} />
@@ -584,6 +720,7 @@ function SolutionCard(props: SolutionCardProps) {
           .map((placement) => (
             <span key={placement.pieceId} className="chip">
               #{piecesById.get(placement.pieceId)?.label} {placement.rotation === 0 ? 'no rotation' : `↻ ${placement.rotation * 60}°`}
+              {placement.neighborCount !== null && ` · ${placement.neighborCount} neighbors`}
             </span>
           ))}
         {unplacedIds.map((id) => (
