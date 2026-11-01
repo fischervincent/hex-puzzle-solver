@@ -14,12 +14,10 @@ import {
   type Cell,
   type Link,
 } from './lib/hex'
+import { IMPORTANCE_LEVELS, RANKED_LEVELS, parseSetup, type Importance, type Setup } from './lib/setup'
 import type { Solution, SolverInput, SolverOutput } from './lib/solver'
 
-type Importance = 'mandatory' | 'high' | 'medium' | 'optional' | 'skip'
-
-const IMPORTANCE_LEVELS: Importance[] = ['mandatory', 'high', 'medium', 'optional', 'skip']
-const RANKED_LEVELS: Importance[] = ['mandatory', 'high', 'medium', 'optional']
+const IMPORTED_SOURCE_KEY = -1
 const DEFAULT_IMPORTANCE: Importance = 'medium'
 
 const IMPORTANCE_LABELS: Record<Importance, string> = {
@@ -112,6 +110,10 @@ export default function App() {
   const [wantsNeighbors, setWantsNeighbors] = useState<Record<number, boolean>>({})
   const [linkGroups, setLinkGroups] = useState<number[][]>([])
   const [selectedForLink, setSelectedForLink] = useState<number[]>([])
+  const [importedPieces, setImportedPieces] = useState<Piece[]>([])
+  const [importedAngle, setImportedAngle] = useState<number | null>(null)
+  const [copied, setCopied] = useState(false)
+  const setupFileInputRef = useRef<HTMLInputElement>(null)
   const [timeLimit, setTimeLimit] = useState(10_000)
   const [solving, setSolving] = useState(false)
   const [result, setResult] = useState<{ inputKey: string; output: SolverOutput } | null>(null)
@@ -121,9 +123,10 @@ export default function App() {
   const nextIdRef = useRef(0)
 
   const detection = boardSource?.detection ?? null
-  const angle = detection?.displayAngle ?? extraSources[0]?.detection.displayAngle ?? FLAT_TOP_ANGLE
+  const angle =
+    detection?.displayAngle ?? importedAngle ?? extraSources[0]?.detection.displayAngle ?? FLAT_TOP_ANGLE
   const detectedPieces = useMemo(() => {
-    const combined: Piece[] = []
+    const combined: Piece[] = [...importedPieces]
     for (const source of boardSource ? [boardSource, ...extraSources] : extraSources) {
       source.detection.pieces.forEach((piece, index) =>
         combined.push({
@@ -137,7 +140,7 @@ export default function App() {
       )
     }
     return combined
-  }, [boardSource, extraSources])
+  }, [importedPieces, boardSource, extraSources])
   const labelById = useMemo(() => new Map(detectedPieces.map((piece) => [piece.id, piece.label])), [detectedPieces])
   const pieces = useMemo(() => {
     const byId = new Map(detectedPieces.map((piece) => [piece.id, piece]))
@@ -284,6 +287,94 @@ export default function App() {
     [board, edgeCells, pieces, importanceOf, canRotate, avoidsEdge, wantsNeighbors, timeLimit],
   )
   const solverInputKey = useMemo(() => JSON.stringify(solverInput), [solverInput])
+
+  const buildSetup = (): Setup => ({
+    version: 1,
+    angle,
+    board,
+    timeLimitMs: timeLimit,
+    pieces: pieces.map((piece) => ({
+      label: piece.label,
+      color: piece.color,
+      hue: piece.hue,
+      cells: piece.latticeCells,
+      links: piece.shape.links,
+      boardCells: piece.boardCells,
+      importance: importanceOf(piece),
+      wantsNeighbors: wantsNeighbors[piece.id] ?? false,
+      rotatable: canRotate(piece),
+      avoidEdge: avoidsEdge(piece),
+    })),
+  })
+
+  const exportSetup = () => {
+    const blob = new Blob([JSON.stringify(buildSetup(), null, 1)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'hexfit-setup.json'
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const copySetup = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(buildSetup()))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      setError('Could not copy to the clipboard. Use Export setup instead.')
+    }
+  }
+
+  const importSetup = async (file: File) => {
+    try {
+      const setup = parseSetup(await file.text())
+      const restored: Piece[] = setup.pieces.map((setupPiece) => {
+        const id = nextIdRef.current++
+        return {
+          id,
+          label: setupPiece.label,
+          color: setupPiece.color,
+          hue: setupPiece.hue,
+          shape: { cells: translateToOrigin(setupPiece.cells), links: setupPiece.links },
+          nodes: [],
+          latticeCells: setupPiece.cells,
+          boardCells: setupPiece.boardCells,
+          sourceKey: IMPORTED_SOURCE_KEY,
+          partIds: [id],
+        }
+      })
+      const restoredClasses = groupByColor(restored)
+      const isEveryPieceIn = (colorClass: ColorClass, rule: (index: number) => boolean) =>
+        colorClass.pieceIds.every((id) => rule(restored.findIndex((piece) => piece.id === id)))
+
+      setBoardSource(null)
+      setExtraSources([])
+      setLinkGroups([])
+      setSelectedForLink([])
+      setResult(null)
+      setImportedPieces(restored)
+      setImportedAngle(setup.angle)
+      setBoard(setup.board)
+      if (TIME_LIMITS.includes(setup.timeLimitMs)) setTimeLimit(setup.timeLimitMs)
+      setImportance(Object.fromEntries(restored.map((piece, index) => [piece.id, setup.pieces[index].importance])))
+      setWantsNeighbors(Object.fromEntries(restored.map((piece, index) => [piece.id, setup.pieces[index].wantsNeighbors])))
+      setRotationByColor(
+        Object.fromEntries(
+          restoredClasses.map((colorClass) => [colorClass.id, isEveryPieceIn(colorClass, (index) => setup.pieces[index].rotatable)]),
+        ),
+      )
+      setAvoidEdgeByColor(
+        Object.fromEntries(
+          restoredClasses.map((colorClass) => [colorClass.id, isEveryPieceIn(colorClass, (index) => setup.pieces[index].avoidEdge)]),
+        ),
+      )
+      setError(null)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not read this setup file.')
+    }
+  }
 
   const startSolving = () => {
     workerRef.current?.terminate()
@@ -626,6 +717,29 @@ export default function App() {
             </button>
           )}
           <span className="muted">{tierSummary(totalsByTier)}</span>
+        </div>
+        <div className="controls setup-controls">
+          <button type="button" disabled={pieces.length === 0} onClick={exportSetup}>
+            Export setup
+          </button>
+          <button type="button" disabled={pieces.length === 0} onClick={() => void copySetup()}>
+            {copied ? 'Copied!' : 'Copy setup'}
+          </button>
+          <button type="button" onClick={() => setupFileInputRef.current?.click()}>
+            Import setup
+          </button>
+          <input
+            ref={setupFileInputRef}
+            type="file"
+            accept="application/json,.json"
+            hidden
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (file) void importSetup(file)
+              event.target.value = ''
+            }}
+          />
+          <span className="muted">Save the board, pieces and settings as a file to share or reload later.</span>
         </div>
         {solving && <p className="status">Searching… (up to {timeLimit / 1000} s)</p>}
         {result && !solving && (

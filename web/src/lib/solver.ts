@@ -49,6 +49,7 @@ type TypePlacement = { typeIndex: number; rotation: number; cellIndices: number[
 type Score = number[]
 
 const CLOCK_CHECK_INTERVAL = 4096
+const FIT_PHASE_SHARE = 0.5
 const FREE = 0
 const FILLED = 1
 const LEFT_EMPTY = 2
@@ -182,11 +183,18 @@ export function solve(input: SolverInput): SolverOutput {
   const placedByTier = new Array<number>(tierCount).fill(0)
   const otherPiecesMax = Math.max(0, input.pieces.length - 1)
 
+  const boosterCopies = types.flatMap((type, typeIndex) =>
+    type.wantsNeighbors ? type.pieceIds.map(() => typeIndex) : [],
+  )
+
   let freeCells = board.length
   let cellsCovered = 0
   let explored = 0
   let timedOut = false
-  const best: { score: Score; placements: TypePlacement[] }[] = []
+  let scoringNeighbors = false
+  let tierFloor: number[] | null = null
+  let deadline = started + (boosterCopies.length > 0 ? input.timeLimitMs * FIT_PHASE_SHARE : input.timeLimitMs)
+  const best: { score: Score; key: string; placements: TypePlacement[] }[] = []
 
   const fits = (placement: TypePlacement) =>
     remaining[placement.typeIndex] > 0 && placement.cellIndices.every((index) => occupied[index] === FREE)
@@ -215,6 +223,7 @@ export function solve(input: SolverInput): SolverOutput {
   }
 
   const neighborScoreBound = (): number => {
+    if (!scoringNeighbors) return 0
     const piecesLeft = sum(remaining)
     let bound = 0
     stack.forEach((placement, stackIndex) => {
@@ -256,12 +265,15 @@ export function solve(input: SolverInput): SolverOutput {
   }
 
   const cannotBeatKept = (bound: Score): boolean =>
-    best.length >= input.maxSolutions && compareScores(bound, best[best.length - 1].score) <= 0
+    (tierFloor !== null && compareScores(bound.slice(0, tierCount), tierFloor) < 0) ||
+    (best.length >= input.maxSolutions && compareScores(bound, best[best.length - 1].score) <= 0)
 
   const record = () => {
-    const score = [...placedByTier, currentNeighborScore(), cellsCovered]
+    const score = [...placedByTier, scoringNeighbors ? currentNeighborScore() : 0, cellsCovered]
     if (cannotBeatKept(score)) return
-    best.push({ score, placements: [...stack] })
+    const key = layoutKey(stack)
+    if (best.some((kept) => kept.key === key)) return
+    best.push({ score, key, placements: [...stack] })
     best.sort((a, b) => compareScores(b.score, a.score))
     if (best.length > input.maxSolutions) best.pop()
   }
@@ -269,7 +281,7 @@ export function solve(input: SolverInput): SolverOutput {
   const search = (start: number): void => {
     if (timedOut) return
     explored++
-    if (explored % CLOCK_CHECK_INTERVAL === 0 && performance.now() - started > input.timeLimitMs) {
+    if (explored % CLOCK_CHECK_INTERVAL === 0 && performance.now() > deadline) {
       timedOut = true
       return
     }
@@ -326,11 +338,20 @@ export function solve(input: SolverInput): SolverOutput {
     const around = new Set(placement.cellIndices.flatMap((index) => neighborIndices[index]))
     return [...around].filter((index) => !inside.has(index)).length
   }
-  const boosterCopies = types.flatMap((type, typeIndex) =>
-    type.wantsNeighbors ? type.pieceIds.map(() => typeIndex) : [],
-  )
+  const boardCenter = {
+    i: sum(board.map((cell) => cell.i)) / board.length,
+    j: sum(board.map((cell) => cell.j)) / board.length,
+  }
+  const distanceFromCenter = (placement: TypePlacement): number => {
+    const cells = placement.cellIndices.map((index) => board[index])
+    const di = sum(cells.map((cell) => cell.i)) / cells.length - boardCenter.i
+    const dj = sum(cells.map((cell) => cell.j)) / cells.length - boardCenter.j
+    return (Math.abs(di) + Math.abs(dj) + Math.abs(di + dj)) / 2
+  }
   const boosterPlacements = types.map((_, typeIndex) =>
-    [...placementsOfType[typeIndex]].sort((a, b) => boardNeighborCount(b) - boardNeighborCount(a)),
+    [...placementsOfType[typeIndex]].sort(
+      (a, b) => boardNeighborCount(b) - boardNeighborCount(a) || distanceFromCenter(a) - distanceFromCenter(b),
+    ),
   )
 
   const placeBoostersThenSearch = (copy: number): void => {
@@ -373,7 +394,21 @@ export function solve(input: SolverInput): SolverOutput {
     remaining[typeIndex]++
   }
 
-  placeBoostersThenSearch(0)
+  search(0)
+  let complete = !timedOut
+
+  if (boosterCopies.length > 0) {
+    for (const kept of best) {
+      kept.score[tierCount] = neighborScoreOfLayout(kept.placements, types, neighborIndices)
+    }
+    best.sort((a, b) => compareScores(b.score, a.score))
+    tierFloor = best.length > 0 ? best[0].score.slice(0, tierCount) : null
+    scoringNeighbors = true
+    timedOut = false
+    deadline = started + input.timeLimitMs
+    placeBoostersThenSearch(0)
+    complete = complete && !timedOut
+  }
 
   const piecesById = new Map(input.pieces.map((piece) => [piece.id, piece]))
   const solutions = best.map(({ placements }) =>
@@ -381,10 +416,39 @@ export function solve(input: SolverInput): SolverOutput {
   )
   return {
     solutions,
-    complete: !timedOut,
+    complete,
     explored,
     elapsedMs: performance.now() - started,
   }
+}
+
+function layoutKey(placements: TypePlacement[]): string {
+  return placements
+    .map((placement) => `${placement.typeIndex}:${[...placement.cellIndices].sort((a, b) => a - b).join(',')}`)
+    .sort()
+    .join('|')
+}
+
+function neighborCountsOfLayout(placements: TypePlacement[], neighborIndices: number[][]): number[] {
+  const ownerByCell = new Map<number, number>()
+  placements.forEach((placement, index) => {
+    for (const cell of placement.cellIndices) ownerByCell.set(cell, index)
+  })
+  return placements.map((placement, index) => {
+    const touching = new Set<number>()
+    for (const cell of placement.cellIndices) {
+      for (const neighbor of neighborIndices[cell]) {
+        const neighborOwner = ownerByCell.get(neighbor)
+        if (neighborOwner !== undefined && neighborOwner !== index) touching.add(neighborOwner)
+      }
+    }
+    return touching.size
+  })
+}
+
+function neighborScoreOfLayout(placements: TypePlacement[], types: PieceType[], neighborIndices: number[][]): number {
+  const counts = neighborCountsOfLayout(placements, neighborIndices)
+  return sum(placements.map((placement, index) => (types[placement.typeIndex].wantsNeighbors ? counts[index] : 0)))
 }
 
 function toSolution(
@@ -395,20 +459,7 @@ function toSolution(
   piecesById: Map<number, SolverPiece>,
   tierCount: number,
 ): Solution {
-  const ownerByCell = new Map<number, number>()
-  placements.forEach((placement, stackIndex) => {
-    for (const index of placement.cellIndices) ownerByCell.set(index, stackIndex)
-  })
-  const neighborCountOf = (stackIndex: number): number => {
-    const touching = new Set<number>()
-    for (const cell of placements[stackIndex].cellIndices) {
-      for (const neighbor of neighborIndices[cell]) {
-        const neighborOwner = ownerByCell.get(neighbor)
-        if (neighborOwner !== undefined && neighborOwner !== stackIndex) touching.add(neighborOwner)
-      }
-    }
-    return touching.size
-  }
+  const neighborCounts = neighborCountsOfLayout(placements, neighborIndices)
 
   const nextCopy = types.map(() => 0)
   const resolved = placements.flatMap((placement, stackIndex) => {
@@ -416,7 +467,7 @@ function toSolution(
     const piece = piecesById.get(type.pieceIds[nextCopy[placement.typeIndex]++])
     if (!piece) return []
     const targetCells = placement.cellIndices.map((index) => board[index])
-    const neighborCount = type.wantsNeighbors ? neighborCountOf(stackIndex) : null
+    const neighborCount = type.wantsNeighbors ? neighborCounts[stackIndex] : null
     return [{ ...orientPiece(piece, targetCells), neighborCount, tier: type.tier }]
   })
   return {
