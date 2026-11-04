@@ -1,9 +1,36 @@
-import { useEffect, useRef } from 'react'
-import { hexVertices, type Detection } from '../lib/detect'
+import { useEffect, useRef, type MouseEvent } from 'react'
+import { hexVertices, type DetectedPiece, type Detection } from '../lib/detect'
+import type { Point } from '../lib/hex'
 
-type Props = { bitmap: ImageBitmap; detection: Detection | null; labels: string[]; showBoard?: boolean }
+type Props = {
+  bitmap: ImageBitmap
+  detection: Detection | null
+  labels: string[]
+  showBoard?: boolean
+  linkedGroups?: number[][]
+  selectedIndices?: number[]
+  onPieceClick?: (index: number) => void
+}
 
-export function ScreenshotPreview({ bitmap, detection, labels, showBoard = true }: Props) {
+const LINK_COLOR = '#f0a43a'
+const CLICK_REACH_IN_NODE_RADII = 1.4
+
+function centerOf(piece: DetectedPiece): Point {
+  return {
+    x: piece.nodes.reduce((sum, node) => sum + node.x, 0) / piece.nodes.length,
+    y: piece.nodes.reduce((sum, node) => sum + node.y, 0) / piece.nodes.length,
+  }
+}
+
+export function ScreenshotPreview({
+  bitmap,
+  detection,
+  labels,
+  showBoard = true,
+  linkedGroups = [],
+  selectedIndices = [],
+  onPieceClick,
+}: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
@@ -34,6 +61,19 @@ export function ScreenshotPreview({ bitmap, detection, labels, showBoard = true 
       }
     }
 
+    context.setLineDash([lineWidth * 3, lineWidth * 2])
+    context.strokeStyle = LINK_COLOR
+    context.lineWidth = lineWidth * 1.5
+    for (const group of linkedGroups) {
+      const centers = group.flatMap((index) => (detection.pieces[index] ? [centerOf(detection.pieces[index])] : []))
+      context.beginPath()
+      centers.forEach((center, index) =>
+        index === 0 ? context.moveTo(center.x, center.y) : context.lineTo(center.x, center.y),
+      )
+      context.stroke()
+    }
+    context.setLineDash([])
+
     detection.pieces.forEach((piece, index) => {
       context.strokeStyle = piece.color
       context.lineWidth = lineWidth * 2
@@ -43,7 +83,15 @@ export function ScreenshotPreview({ bitmap, detection, labels, showBoard = true 
         context.lineTo(piece.nodes[b].x, piece.nodes[b].y)
         context.stroke()
       }
+      const isSelected = selectedIndices.includes(index)
       for (const node of piece.nodes) {
+        if (isSelected) {
+          context.beginPath()
+          context.arc(node.x, node.y, detection.nodeRadius * 1.15, 0, Math.PI * 2)
+          context.strokeStyle = LINK_COLOR
+          context.lineWidth = lineWidth * 2
+          context.stroke()
+        }
         context.beginPath()
         context.arc(node.x, node.y, detection.nodeRadius * 0.55, 0, Math.PI * 2)
         context.fillStyle = piece.color
@@ -57,7 +105,27 @@ export function ScreenshotPreview({ bitmap, detection, labels, showBoard = true 
       context.fillStyle = '#fff'
       context.fillText(`#${labels[index]}`, top.x + detection.nodeRadius * 0.7, top.y - detection.nodeRadius * 0.6)
     })
-  }, [bitmap, detection, labels, showBoard])
+  }, [bitmap, detection, labels, showBoard, linkedGroups, selectedIndices])
 
-  return <canvas ref={canvasRef} className="screenshot-canvas" />
+  const handleClick = (event: MouseEvent<HTMLCanvasElement>) => {
+    if (!onPieceClick || !detection) return
+    event.stopPropagation()
+    const rect = event.currentTarget.getBoundingClientRect()
+    const scale = Math.min(rect.width / bitmap.width, rect.height / bitmap.height)
+    const x = (event.clientX - rect.left - (rect.width - bitmap.width * scale) / 2) / scale
+    const y = (event.clientY - rect.top - (rect.height - bitmap.height * scale) / 2) / scale
+    const reach = detection.nodeRadius * CLICK_REACH_IN_NODE_RADII
+    const index = detection.pieces.findIndex((piece) =>
+      piece.nodes.some((node) => Math.hypot(node.x - x, node.y - y) <= reach),
+    )
+    if (index >= 0) onPieceClick(index)
+  }
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className={onPieceClick ? 'screenshot-canvas screenshot-selecting' : 'screenshot-canvas'}
+      onClick={handleClick}
+    />
+  )
 }

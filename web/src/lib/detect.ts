@@ -23,6 +23,11 @@ const DISK_RADIUS_RATIO = 0.95
 const MIN_DISK_COVERAGE = 0.64
 const NEIGHBOR_MIN_PITCHES = 0.65
 const NEIGHBOR_MAX_PITCHES = 1.35
+const PITCH_PER_NODE_RADIUS = 3.8
+const PITCH_MATCH_TOLERANCE = 0.12
+const MAX_AXIS_STEPS = 3
+const AXIS_STEP_TOLERANCE = 0.08
+const FLAT_TOP_PHASE = Math.PI / 6
 const BAR_SAMPLE_COUNT = 30
 const BAR_MATCH_RATIO = 0.75
 const BAR_SEGMENT_START = 0.3
@@ -56,22 +61,26 @@ export type Detection = {
   lattice: Lattice | null
   displayAngle: number
   nodeRadius: number
+  pitch: number
 }
+
+type AxisPair = { pair: Link; steps: number }
 
 export function detect(image: RgbaImage): Detection {
   const hsv = toHsv(image)
   const colored = coloredMask(hsv)
   const { nodes, nodeRadius } = findNodes(image, hsv, colored)
   if (nodes.length === 0) {
-    return { pieces: [], board: [], lattice: null, displayAngle: 30, nodeRadius: 0 }
+    return { pieces: [], board: [], lattice: null, displayAngle: 30, nodeRadius: 0, pitch: 0 }
   }
 
-  const pitch = cellPitch(nodes)
-  const neighborPairs = findNeighborPairs(nodes, pitch)
+  const pitch = cellPitch(nodes, nodeRadius)
+  const axisPairs = findAxisPairs(nodes, pitch)
+  const neighborPairs = axisPairs.filter(({ steps }) => steps === 1).map(({ pair }) => pair)
   const links = neighborPairs.filter(([a, b]) => isBarBetween(hsv, colored, nodes[a], nodes[b]))
   const groups = groupByLinks(nodes.length, links)
 
-  const { lattice, phaseDegrees } = fitLattice(nodes, neighborPairs, pitch)
+  const { lattice, phaseDegrees } = fitLattice(nodes, axisPairs, pitch)
   const board = detectBoardCells(hsv, colored, lattice)
   const boardKeys = new Set(board.map(cellKey))
 
@@ -86,6 +95,7 @@ export function detect(image: RgbaImage): Detection {
     lattice,
     displayAngle: Math.round(phaseDegrees / 30) % 2 === 1 ? 30 : 0,
     nodeRadius,
+    pitch,
   }
 }
 
@@ -209,19 +219,30 @@ function distanceBetween(a: Point, b: Point): number {
   return Math.hypot(a.x - b.x, a.y - b.y)
 }
 
-function cellPitch(nodes: Point[]): number {
-  if (nodes.length < 2) return 1
-  return median(
+function cellPitch(nodes: Point[], nodeRadius: number): number {
+  const expected = nodeRadius * PITCH_PER_NODE_RADIUS
+  if (nodes.length < 2) return expected
+  const nearest = median(
     nodes.map((a) => Math.min(...nodes.filter((b) => b !== a).map((b) => distanceBetween(a, b)))),
   )
+  const isCloseToExpected = (candidate: number) => Math.abs(candidate - expected) <= expected * PITCH_MATCH_TOLERANCE
+  return isCloseToExpected(nearest) ? nearest : expected
 }
 
-function findNeighborPairs(nodes: Point[], pitch: number): Link[] {
-  const pairs: Link[] = []
+function axisSteps(distance: number, pitch: number): number | null {
+  if (distance >= pitch * NEIGHBOR_MIN_PITCHES && distance <= pitch * NEIGHBOR_MAX_PITCHES) return 1
+  for (let steps = 2; steps <= MAX_AXIS_STEPS; steps++) {
+    if (Math.abs(distance / pitch - steps) <= steps * AXIS_STEP_TOLERANCE) return steps
+  }
+  return null
+}
+
+function findAxisPairs(nodes: Point[], pitch: number): AxisPair[] {
+  const pairs: AxisPair[] = []
   for (let a = 0; a < nodes.length; a++) {
     for (let b = a + 1; b < nodes.length; b++) {
-      const distance = distanceBetween(nodes[a], nodes[b])
-      if (distance >= pitch * NEIGHBOR_MIN_PITCHES && distance <= pitch * NEIGHBOR_MAX_PITCHES) pairs.push([a, b])
+      const steps = axisSteps(distanceBetween(nodes[a], nodes[b]), pitch)
+      if (steps !== null) pairs.push({ pair: [a, b], steps })
     }
   }
   return pairs
@@ -282,9 +303,9 @@ export function latticePoint(lattice: Lattice, cell: { i: number; j: number }): 
   }
 }
 
-function estimateBasis(nodes: Point[], pairs: Link[], pitch: number): { e1: Point; e2: Point; phase: number } {
-  const vectors = pairs.map(([a, b]) => {
-    const vector = { x: nodes[b].x - nodes[a].x, y: nodes[b].y - nodes[a].y }
+function estimateBasis(nodes: Point[], pairs: AxisPair[], pitch: number): { e1: Point; e2: Point; phase: number } {
+  const vectors = pairs.map(({ pair: [a, b], steps }) => {
+    const vector = { x: (nodes[b].x - nodes[a].x) / steps, y: (nodes[b].y - nodes[a].y) / steps }
     return vector.y < 0 || (vector.y === 0 && vector.x < 0) ? { x: -vector.x, y: -vector.y } : vector
   })
 
@@ -296,7 +317,7 @@ function estimateBasis(nodes: Point[], pairs: Link[], pitch: number): { e1: Poin
     sumSin += Math.sin(6 * angle)
   }
   const sixtyDegrees = Math.PI / 3
-  let phase = Math.atan2(sumSin, sumCos) / 6
+  let phase = vectors.length === 0 ? FLAT_TOP_PHASE : Math.atan2(sumSin, sumCos) / 6
   if (phase < 0) phase += sixtyDegrees
 
   const clusters: Point[][] = [[], [], []]
@@ -315,13 +336,15 @@ function estimateBasis(nodes: Point[], pairs: Link[], pitch: number): { e1: Poin
   return { e1: directionAt(0), e2: directionAt(1), phase }
 }
 
-function fitLattice(nodes: Point[], pairs: Link[], pitch: number): { lattice: Lattice; phaseDegrees: number } {
+function fitLattice(nodes: Point[], pairs: AxisPair[], pitch: number): { lattice: Lattice; phaseDegrees: number } {
   const { e1, e2, phase } = estimateBasis(nodes, pairs, pitch)
   const phaseDegrees = (phase * 180) / Math.PI
   const inverse = inverseBasis(e1, e2)
 
   const adjacency: number[][] = nodes.map(() => [])
-  for (const [a, b] of pairs) {
+  for (const {
+    pair: [a, b],
+  } of pairs) {
     adjacency[a].push(b)
     adjacency[b].push(a)
   }

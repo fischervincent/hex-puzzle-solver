@@ -42,6 +42,42 @@ type Source = {
 
 type Piece = DetectedPiece & { label: string; sourceKey: number; partIds: number[] }
 
+type LinkMode = { sourceKey: number; selected: number[] }
+
+type LinkControlsProps = {
+  source: Source
+  linkMode: LinkMode | null
+  onStart: () => void
+  onValidate: () => void
+  onDone: () => void
+}
+
+function LinkControls({ source, linkMode, onStart, onValidate, onDone }: LinkControlsProps) {
+  if (source.detection.pieces.length < 2) return null
+  if (linkMode?.sourceKey !== source.key) {
+    return (
+      <div className="link-controls">
+        <button type="button" className="small" onClick={onStart}>
+          Link groups
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className="link-controls link-controls-active">
+      <span>
+        Click the groups that make one upgrade, then validate. <strong>{linkMode.selected.length} selected</strong>
+      </span>
+      <button type="button" className="small primary" disabled={linkMode.selected.length < 2} onClick={onValidate}>
+        Validate link
+      </button>
+      <button type="button" className="small" onClick={onDone}>
+        Done
+      </button>
+    </div>
+  )
+}
+
 function linkParts(parts: Piece[]): Piece {
   let offset = 0
   const links: Link[] = parts.flatMap((part) => {
@@ -109,7 +145,7 @@ export default function App() {
   const [avoidEdgeByColor, setAvoidEdgeByColor] = useState<Record<string, boolean>>({})
   const [wantsNeighbors, setWantsNeighbors] = useState<Record<number, boolean>>({})
   const [linkGroups, setLinkGroups] = useState<number[][]>([])
-  const [selectedForLink, setSelectedForLink] = useState<number[]>([])
+  const [linkMode, setLinkMode] = useState<LinkMode | null>(null)
   const [importedPieces, setImportedPieces] = useState<Piece[]>([])
   const [importedAngle, setImportedAngle] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
@@ -181,25 +217,41 @@ export default function App() {
     [colorClassOf, avoidEdgeByColor],
   )
 
-  const linkSelected = () => {
-    const selectedPieces = pieces.filter((piece) => selectedForLink.includes(piece.id))
-    if (new Set(selectedPieces.map((piece) => piece.sourceKey)).size > 1) {
-      setError('Only pieces from the same picture can be linked, so their spacing is known.')
-      return
-    }
-    const partIds = selectedPieces.flatMap((piece) => piece.partIds)
+  const togglePieceInLinkMode = (source: Source, index: number) => {
+    const id = source.pieceIds[index]
+    setLinkMode((current) =>
+      current && current.sourceKey === source.key
+        ? {
+            ...current,
+            selected: current.selected.includes(id)
+              ? current.selected.filter((selectedId) => selectedId !== id)
+              : [...current.selected, id],
+          }
+        : current,
+    )
+  }
+
+  const validateLink = () => {
+    if (!linkMode || linkMode.selected.length < 2) return
+    const partIds = linkMode.selected
     setLinkGroups((current) => [...current.filter((group) => !group.some((id) => partIds.includes(id))), partIds])
-    setSelectedForLink([])
-    setError(null)
+    setLinkMode({ ...linkMode, selected: [] })
   }
 
   const unlink = (piece: Piece) =>
     setLinkGroups((current) => current.filter((group) => !group.includes(piece.id)))
 
-  const toggleLinkSelection = (piece: Piece) =>
-    setSelectedForLink((current) =>
-      current.includes(piece.id) ? current.filter((id) => id !== piece.id) : [...current, piece.id],
-    )
+  const previewLinkProps = (source: Source) => {
+    const indexOf = (id: number) => source.pieceIds.indexOf(id)
+    const isLinking = linkMode?.sourceKey === source.key
+    return {
+      linkedGroups: linkGroups
+        .filter((group) => group.every((id) => source.pieceIds.includes(id)))
+        .map((group) => group.map(indexOf)),
+      selectedIndices: isLinking ? linkMode.selected.map(indexOf) : [],
+      onPieceClick: isLinking ? (index: number) => togglePieceInLinkMode(source, index) : undefined,
+    }
+  }
 
   const analyze = useCallback(async (file: Blob, name: string): Promise<Source> => {
     const bitmap = await createImageBitmap(file)
@@ -352,7 +404,7 @@ export default function App() {
       setBoardSource(null)
       setExtraSources([])
       setLinkGroups([])
-      setSelectedForLink([])
+      setLinkMode(null)
       setResult(null)
       setImportedPieces(restored)
       setImportedAngle(setup.angle)
@@ -459,6 +511,7 @@ export default function App() {
               bitmap={boardSource.bitmap}
               detection={boardSource.detection}
               labels={boardSource.pieceIds.map((id) => labelById.get(id) ?? '')}
+              {...previewLinkProps(boardSource)}
             />
           ) : (
             <div className="dropzone-empty">
@@ -473,6 +526,15 @@ export default function App() {
             <strong>{boardSource.detection.board.length} board cells</strong> in{' '}
             {formatSeconds(boardSource.detectionMs)}. Click the image to replace it.
           </p>
+        )}
+        {boardSource && (
+          <LinkControls
+            source={boardSource}
+            linkMode={linkMode}
+            onStart={() => setLinkMode({ sourceKey: boardSource.key, selected: [] })}
+            onValidate={validateLink}
+            onDone={() => setLinkMode(null)}
+          />
         )}
 
         <div className="extra-header">
@@ -506,6 +568,7 @@ export default function App() {
                   detection={source.detection}
                   labels={source.pieceIds.map((id) => labelById.get(id) ?? '')}
                   showBoard={false}
+                  {...previewLinkProps(source)}
                 />
                 <div className="extra-meta">
                   <span className="muted" title={source.name}>
@@ -518,6 +581,13 @@ export default function App() {
                     Remove
                   </button>
                 </div>
+                <LinkControls
+                  source={source}
+                  linkMode={linkMode}
+                  onStart={() => setLinkMode({ sourceKey: source.key, selected: [] })}
+                  onValidate={validateLink}
+                  onDone={() => setLinkMode(null)}
+                />
               </article>
             ))}
           </div>
@@ -606,21 +676,9 @@ export default function App() {
                 </label>
               ))}
             </div>
-            <div className="link-bar">
-              <span className="muted">
-                Some upgrades are several separate node groups. Tick them (same picture) and link them to keep their
-                spacing.
-              </span>
-              <button type="button" disabled={selectedForLink.length < 2} onClick={linkSelected}>
-                Link selected ({selectedForLink.length})
-              </button>
-            </div>
             <div className="piece-grid">
               {pieces.map((piece) => (
-                <article
-                  key={piece.id}
-                  className={`piece-card piece-${importanceOf(piece)}${selectedForLink.includes(piece.id) ? ' piece-selected' : ''}`}
-                >
+                <article key={piece.id} className={`piece-card piece-${importanceOf(piece)}`}>
                   <div className="piece-preview">
                     <PieceView
                       angleDeg={angle}
@@ -651,19 +709,10 @@ export default function App() {
                       />
                       Wants neighbors
                     </label>
-                    {piece.partIds.length > 1 ? (
+                    {piece.partIds.length > 1 && (
                       <button type="button" className="small" onClick={() => unlink(piece)}>
                         Unlink
                       </button>
-                    ) : (
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={selectedForLink.includes(piece.id)}
-                          onChange={() => toggleLinkSelection(piece)}
-                        />
-                        Link
-                      </label>
                     )}
                   </div>
                   <select

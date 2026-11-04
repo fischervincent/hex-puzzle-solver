@@ -206,19 +206,24 @@ select {
   fill: #2a1416;
 }
 
-.link-bar {
+.link-controls {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 14px;
-  font-size: 0.88rem;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 0.86rem;
 }
 
-.piece-selected {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
+.link-controls-active {
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--accent);
+  background: rgba(240, 164, 58, 0.08);
+}
+
+.screenshot-selecting {
+  cursor: crosshair;
 }
 
 .piece-options {
